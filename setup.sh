@@ -23,7 +23,8 @@ sudo apt install -y \
     libffi-dev \
     nginx \
     curl \
-    git
+    git \
+    redis-server
 
 # Setup project directory
 echo "[*] Setting up project directory..."
@@ -103,4 +104,11 @@ echo "   3. First run for Google auth:"
 echo "      cd $PROJECT_DIR && source venv/bin/activate && python main.py"
 echo "   4. Start service: sudo systemctl start mirror-download"
 echo "   5. Setup Nginx + SSL: sudo ./setup_nginx.sh"
+echo ""
+echo "Option C - With Celery (for production/scale):"
+echo "   1. Edit .env and set USE_CELERY=true"
+echo "   2. Start Redis: sudo systemctl start redis"
+echo "   3. Start Celery Worker: ./start_celery.sh"
+echo "   4. Or use systemd: sudo ./celery_systemd.sh"
+echo "   5. Start main server: sudo systemctl start mirror-download"
 echo ""

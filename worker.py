@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 import httpx
-from typing import Optional
+from typing import Optional, Dict
 
 from config import get_settings
 from models import DownloadStatus, NotificationPayload
@@ -26,6 +26,35 @@ class DownloadWorker:
         self._running = False
         self._queue = asyncio.Queue()
         self._current_task: Optional[str] = None
+        self._active_tasks: Dict[str, asyncio.Task] = {}  # Track running tasks for cancellation
+        self._cancelled_tasks: set = set()  # Track cancelled task IDs
+    
+    def cancel_task(self, task_id: str) -> bool:
+        """
+        Cancel a running task.
+        
+        Args:
+            task_id: The task ID to cancel
+            
+        Returns:
+            True if task was found and cancelled, False otherwise
+        """
+        if task_id in self._active_tasks:
+            task = self._active_tasks[task_id]
+            if not task.done():
+                task.cancel()
+                self._cancelled_tasks.add(task_id)
+                logger.info(f"Task {task_id} cancellation requested")
+                return True
+        return False
+    
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """Check if a task has been marked for cancellation."""
+        return task_id in self._cancelled_tasks
+    
+    def clear_cancellation(self, task_id: str):
+        """Remove task from cancelled set (called after task completes)."""
+        self._cancelled_tasks.discard(task_id)
     
     async def _init_services(self):
         """Initialize services lazily."""
@@ -138,6 +167,17 @@ class DownloadWorker:
         telegram_chat_id = task.get('telegram_chat_id')
         callback_url = task.get('callback_url')
         
+        # Register task for cancellation tracking
+        current_task = asyncio.current_task()
+        self._active_tasks[task_id] = current_task
+        self.clear_cancellation(task_id)
+        
+        # Initialize variables that may be used in exception handlers
+        actual_filename = None
+        file_path = None
+        file_size = 0
+        file_size_human = "0 B"
+        
         try:
             # Initialize services
             await self._init_services()
@@ -163,6 +203,11 @@ class DownloadWorker:
                 else:
                     logger.warning(f"Failed to send start notification for task {task_id}")
             
+            # Check if task was cancelled before starting download
+            if self.is_task_cancelled(task_id):
+                logger.info(f"Task {task_id} was cancelled before download started")
+                raise asyncio.CancelledError("Task cancelled by user")
+            
             # Download file with progress updates
             progress_cb = self._progress_callback(
                 task_id, 
@@ -174,6 +219,17 @@ class DownloadWorker:
                 filename=filename,
                 progress_callback=progress_cb
             )
+            
+            # Check if task was cancelled after download
+            if self.is_task_cancelled(task_id):
+                logger.info(f"Task {task_id} was cancelled after download, cleaning up")
+                # Clean up downloaded file
+                try:
+                    if os.path.exists(download_result['file_path']):
+                        os.remove(download_result['file_path'])
+                except:
+                    pass
+                raise asyncio.CancelledError("Task cancelled by user")
             
             file_path = download_result['file_path']
             actual_filename = download_result['filename']
@@ -187,6 +243,13 @@ class DownloadWorker:
                 file_size=file_size,
                 file_size_human=file_size_human
             )
+            
+            # Check if task was cancelled before upload
+            if self.is_task_cancelled(task_id):
+                logger.info(f"Task {task_id} was cancelled before upload, cleaning up")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                raise asyncio.CancelledError("Task cancelled by user")
             
             # Upload to Google Drive
             self.task_manager.update_task(
@@ -203,6 +266,13 @@ class DownloadWorker:
                     task_id=task_id,
                     filename=actual_filename
                 )
+            
+            # Check if task was cancelled right before upload starts
+            if self.is_task_cancelled(task_id):
+                logger.info(f"Task {task_id} was cancelled before upload starts, cleaning up")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                raise asyncio.CancelledError("Task cancelled by user")
             
             # Create upload progress callback
             last_upload_progress = 0
@@ -285,6 +355,36 @@ class DownloadWorker:
             except Exception as cleanup_error:
                 logger.warning(f"Failed to cleanup file {file_path}: {cleanup_error}")
             
+        except asyncio.CancelledError as e:
+            # Task was cancelled by user
+            error_msg = str(e) if str(e) else "Task cancelled by user"
+            logger.info(f"Task {task_id} was cancelled: {error_msg}")
+            
+            # Update task as cancelled
+            self.task_manager.update_task(
+                task_id,
+                status=DownloadStatus.CANCELLED,
+                message="Task cancelled",
+                error_message=error_msg
+            )
+            
+            # Notify Telegram about cancellation
+            if telegram_chat_id:
+                await self.telegram.notify_download_cancelled(
+                    chat_id=telegram_chat_id,
+                    filename=actual_filename or filename or url,
+                    task_id=task_id
+                )
+            
+            if callback_url:
+                payload = NotificationPayload(
+                    task_id=task_id,
+                    status=DownloadStatus.CANCELLED,
+                    message=f"Task cancelled: {error_msg}",
+                    filename=filename
+                )
+                await self._send_webhook(callback_url, payload)
+        
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Task {task_id} failed: {error_msg}", exc_info=True)
@@ -316,6 +416,9 @@ class DownloadWorker:
                 await self._send_webhook(callback_url, payload)
         
         finally:
+            # Remove from active and cancelled tasks sets
+            self._active_tasks.pop(task_id, None)
+            self._cancelled_tasks.discard(task_id)
             self._current_task = None
     
     async def start(self):

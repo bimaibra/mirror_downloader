@@ -13,3 +13,13 @@ pydantic-settings==2.1.0
 httpx==0.25.2
 python-dotenv==1.0.0
 tenacity==8.2.3
+
+# Celery for distributed task processing
+celery==5.3.4
+redis==5.0.1
+
+# Additional dependencies for Celery
+billiard==4.2.0
+kombu==5.3.4
+amqp==5.2.0
+vine==5.1.0

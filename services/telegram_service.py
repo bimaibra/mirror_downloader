@@ -301,6 +301,34 @@ Please try again or contact admin.
         
         await self.send_message(chat_id, message)
     
+    async def notify_download_cancelled(
+        self, 
+        chat_id: str, 
+        filename: str,
+        task_id: Optional[str] = None
+    ):
+        """Send download cancellation notification."""
+        # Delete progress message if exists
+        if task_id and task_id in self._progress_messages:
+            try:
+                msg = self._progress_messages[task_id]
+                await self.bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+            del self._progress_messages[task_id]
+        
+        task_info = f"🆔 <b>Task ID:</b> <code>{task_id}</code>\n" if task_id else ""
+        
+        message = f"""
+🚫 <b>Download Cancelled!</b>
+
+📄 <b>File:</b> <code>{filename}</code>
+{task_info}
+The task has been cancelled by user.
+        """.strip()
+        
+        await self.send_message(chat_id, message)
+    
     async def send_admin_notification(self, message: str):
         """Send notification to admin."""
         if self.settings.TELEGRAM_ADMIN_CHAT_ID:

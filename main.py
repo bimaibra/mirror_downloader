@@ -202,20 +202,32 @@ async def health_check():
     settings = get_settings()
     
     # Check services
-    services = {
-        "task_manager": True,
-        "worker": get_worker().get_current_task() is not None
+    services_status = {
+        "task_manager": "up",
+        "gdrive": "authenticated" if os.path.exists("token.json") else "not_configured",
+        "telegram": "configured" if settings.TELEGRAM_BOT_TOKEN else "not_configured"
     }
+    
+    # Check worker type
+    if settings.USE_CELERY:
+        try:
+            from celery_app import celery_app
+            # Check Celery/Redis connection
+            inspector = celery_app.control.inspect()
+            active_workers = inspector.active()
+            services_status["worker"] = "celery"
+            services_status["celery_workers"] = len(active_workers) if active_workers else 0
+        except Exception as e:
+            services_status["worker"] = "celery_error"
+            services_status["celery_error"] = str(e)
+    else:
+        worker = get_worker()
+        services_status["worker"] = "busy" if worker.get_current_task() else "idle"
     
     return HealthResponse(
         status="healthy",
         version="1.0.0",
-        services={
-            "task_manager": "up",
-            "worker": "busy" if services["worker"] else "idle",
-            "gdrive": "authenticated" if os.path.exists("token.json") else "not_configured",
-            "telegram": "configured" if settings.TELEGRAM_BOT_TOKEN else "not_configured"
-        }
+        services=services_status
     )
 
 
@@ -234,9 +246,12 @@ async def create_download(
     2. Upload it to Google Drive
     3. Send the Google Drive link via Telegram (if chat_id provided)
     4. Call webhook callback (if provided)
+    
+    Note: If USE_CELERY=True in .env, tasks are processed by Celery workers.
+    Otherwise, uses the built-in async worker.
     """
     task_manager = get_task_manager()
-    worker = get_worker()
+    settings = get_settings()
     
     # Create task
     task_id = task_manager.create_task(
@@ -247,8 +262,30 @@ async def create_download(
         callback_url=str(request.callback_url) if request.callback_url else None
     )
     
-    # Queue task
-    worker.queue_task(task_id)
+    # Check if Celery is enabled
+    if settings.USE_CELERY:
+        try:
+            from tasks import process_download
+            
+            # Queue task with Celery
+            process_download.delay(
+                task_id=task_id,
+                url=str(request.url),
+                filename=request.filename,
+                folder_id=request.folder_id,
+                telegram_chat_id=request.telegram_chat_id,
+                callback_url=str(request.callback_url) if request.callback_url else None
+            )
+            logger.info(f"Task {task_id} queued with Celery")
+        except Exception as e:
+            logger.error(f"Failed to queue task with Celery: {e}")
+            # Fallback to built-in worker
+            worker = get_worker()
+            worker.queue_task(task_id)
+    else:
+        # Use built-in async worker
+        worker = get_worker()
+        worker.queue_task(task_id)
     
     return DownloadResponse(
         task_id=task_id,
@@ -467,7 +504,7 @@ async def telegram_webhook(update: dict):
         if is_authorized(chat_id):
             # Show authorized user menu
             # Check if user is admin to show admin hint
-            admin_hint = "\n\n🔐 Send <code>/admin</code> for admin commands." if chat_id == settings.TELEGRAM_ADMIN_CHAT_ID else ""
+            admin_hint = "\n• /admin - Admin menu" if chat_id == settings.TELEGRAM_ADMIN_CHAT_ID else ""
             
             await telegram.send_message(
                 chat_id=chat_id,
@@ -479,8 +516,8 @@ async def telegram_webhook(update: dict):
 Send me a direct download link and I'll upload it to Google Drive for you!
 
 <b>Commands:</b>
-• /help - Show help
-• /status &lt;task_id&gt; - Check download status{admin_hint}
+• /status &lt;task_id&gt; - Check task status with progress bar
+• /abort &lt;task_id&gt; - Cancel a running task{admin_hint}
 
 Just paste any URL to start downloading.
                 """.strip()
@@ -851,13 +888,79 @@ Or contact admin for access.
         )
         return {"ok": True}
     
+    # /abort command - cancel a running task
+    if text.startswith('/abort'):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Please provide a task ID\nExample: <code>/abort task-abc123</code>"
+            )
+            return {"ok": True}
+        
+        task_id = parts[1].strip()
+        task_manager = get_task_manager()
+        task = task_manager.get_task(task_id)
+        
+        if not task:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"❌ Task <code>{task_id}</code> not found"
+            )
+            return {"ok": True}
+        
+        # Check if task can be cancelled
+        if task['status'] not in ['pending', 'downloading', 'uploading']:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"❌ Cannot abort task with status: <b>{task['status']}</b>\n\nOnly pending or active tasks can be aborted."
+            )
+            return {"ok": True}
+        
+        # Cancel the task in worker (if currently running)
+        worker = get_worker()
+        worker_cancelled = worker.cancel_task(task_id)
+        
+        # Cancel the task in task manager
+        task_manager.update_task(
+            task_id,
+            status=DownloadStatus.CANCELLED,
+            message="Task cancelled by user"
+        )
+        
+        if worker_cancelled:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"""
+🚫 <b>Task Aborted</b>
+
+🆔 <code>{task_id}</code>
+📄 File: <code>{task.get('filename', 'N/A')}</code>
+
+The task has been cancelled and will stop shortly.
+                """.strip()
+            )
+        else:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"""
+🚫 <b>Task Aborted</b>
+
+🆔 <code>{task_id}</code>
+📄 File: <code>{task.get('filename', 'N/A')}</code>
+
+The task has been cancelled (was not actively running).
+                """.strip()
+            )
+        return {"ok": True}
+    
     # /status command (requires auth)
     if text.startswith('/status'):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             await telegram.send_message(
                 chat_id=chat_id,
-                message="❌ Please provide a task ID\nExample: <code>/status task-abc123</code>"
+                message="❌ Please provide a task ID\nExample: <code>/status task-abc123</code>\n\n<b>Commands:</b>\n• /status &lt;task_id&gt; - Show progress with visual bar\n• /abort &lt;task_id&gt; - Cancel running task"
             )
             return {"ok": True}
         
@@ -881,28 +984,96 @@ Or contact admin for access.
             'cancelled': '🚫'
         }.get(task['status'], '❓')
         
-        msg = f"""
-{status_emoji} <b>Task Status</b>
+        # Create progress bar for visual status
+        def create_progress_bar(progress: float, length: int = 20) -> str:
+            filled = int(length * progress / 100)
+            empty = length - filled
+            return '█' * filled + '░' * empty
+        
+        # Build visual status message with progress bar
+        progress = task.get('progress', 0) or 0
+        progress_bar = create_progress_bar(progress)
+        
+        # For active tasks, show visual progress bar
+        if task['status'] in ['downloading', 'uploading']:
+            msg = f"""
+{status_emoji} <b>Task Status - {task['status'].upper()}</b>
 
-🆔 <code>{task_id}</code>
-📊 Status: <b>{task['status'].upper()}</b>
-💬 {task.get('message', 'No message')}
-        """.strip()
-        
-        if task.get('progress'):
-            msg += f"\n📈 Progress: {task['progress']:.1f}%"
-        
-        if task.get('filename'):
-            msg += f"\n📄 File: <code>{task['filename']}</code>"
-        
-        if task.get('file_size_human'):
-            msg += f"\n📦 Size: {task['file_size_human']}"
-        
-        if task.get('gdrive_link'):
-            msg += f"\n\n🔗 <a href='{task['gdrive_link']}'>Google Drive Link</a>"
-        
-        if task.get('error_message'):
-            msg += f"\n\n⚠️ Error: <code>{task['error_message'][:200]}</code>"
+📄 <b>File:</b> <code>{task.get('filename', 'N/A')}</code>
+🆔 <b>Task:</b> <code>{task_id}</code>
+
+[{progress_bar}] <b>{progress:.1f}%</b>
+💬 {task.get('message', 'Processing...')}
+            """.strip()
+            
+            if task.get('file_size_human'):
+                msg += f"\n📦 Size: {task['file_size_human']}"
+            
+            msg += f"\n\n<i>Send /abort {task_id} to cancel</i>"
+            
+            # Delete old progress message and resend for recent chat view
+            try:
+                telegram_service = get_telegram_service()
+                if task_id in telegram_service._progress_messages:
+                    old_msg = telegram_service._progress_messages[task_id]
+                    try:
+                        await telegram_service.bot.delete_message(chat_id, old_msg.message_id)
+                    except Exception:
+                        pass  # Ignore if already deleted or too old
+                    del telegram_service._progress_messages[task_id]
+            except Exception:
+                pass  # Continue even if delete fails
+            
+            # Send new message and track it for future updates
+            new_msg = await telegram.send_message(chat_id=chat_id, message=msg)
+            if new_msg and task_id:
+                try:
+                    telegram_service = get_telegram_service()
+                    telegram_service._progress_messages[task_id] = new_msg
+                except Exception:
+                    pass
+            return {"ok": True}
+            
+        elif task['status'] == 'completed':
+            msg = f"""
+{status_emoji} <b>Task Completed!</b>
+
+📄 <b>File:</b> <code>{task.get('filename', 'N/A')}</code>
+🆔 <b>Task:</b> <code>{task_id}</code>
+📦 <b>Size:</b> {task.get('file_size_human', 'N/A')}
+
+🔗 <a href='{task.get('gdrive_link', '#')}'>Google Drive Link</a>
+            """.strip()
+            
+        elif task['status'] == 'failed':
+            msg = f"""
+{status_emoji} <b>Task Failed</b>
+
+📄 <b>File:</b> <code>{task.get('filename', 'N/A')}</code>
+🆔 <b>Task:</b> <code>{task_id}</code>
+
+⚠️ <b>Error:</b> <code>{task.get('error_message', 'Unknown error')[:200]}</code>
+            """.strip()
+            
+        elif task['status'] == 'cancelled':
+            msg = f"""
+{status_emoji} <b>Task Cancelled</b>
+
+📄 <b>File:</b> <code>{task.get('filename', 'N/A')}</code>
+🆔 <b>Task:</b> <code>{task_id}</code>
+            """.strip()
+            
+        else:  # pending
+            msg = f"""
+{status_emoji} <b>Task Pending</b>
+
+📄 <b>File:</b> <code>{task.get('filename', 'N/A')}</code>
+🆔 <b>Task:</b> <code>{task_id}</code>
+
+⏳ Waiting in queue...
+
+<i>Send /abort {task_id} to cancel</i>
+            """.strip()
         
         await telegram.send_message(chat_id=chat_id, message=msg)
     

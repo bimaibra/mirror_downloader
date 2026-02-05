@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     CODE_EXPIRY_HOURS: int = 24  # Access codes expire after N hours (0 = never)
     MAX_CODES_PER_ADMIN: int = 10  # Max active codes per admin
     
+    # Celery / Redis Configuration (for background tasks)
+    # For single server: install Redis locally
+    # For scaling: use Redis Cloud or separate Redis server
+    REDIS_URL: str = "redis://localhost:6379/0"
+    USE_CELERY: bool = False  # Set to True to enable Celery (requires Redis)
+    
     # Download Settings
     MAX_FILE_SIZE: int = 5 * 1024 * 1024 * 1024  # 5 GB
     CHUNK_SIZE: int = 8192  # 8 KB chunks for streaming

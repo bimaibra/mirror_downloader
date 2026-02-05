@@ -1,0 +1,47 @@
+"""Configuration module for the mirroring download server."""
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # Server Configuration
+    APP_NAME: str = "Mirror Download Server"
+    DEBUG: bool = False
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    
+    # Security
+    API_KEY: str = "your-secret-api-key-change-this"
+    
+    # Google Drive Configuration
+    GOOGLE_CREDENTIALS_FILE: str = "credentials.json"
+    GOOGLE_TOKEN_FILE: str = "token.json"
+    GDRIVE_FOLDER_ID: str = ""  # Optional: default folder ID
+    
+    # Telegram Bot Configuration (optional)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ADMIN_CHAT_ID: str = ""
+    
+    # Bot Access Control
+    CODE_EXPIRY_HOURS: int = 24  # Access codes expire after N hours (0 = never)
+    MAX_CODES_PER_ADMIN: int = 10  # Max active codes per admin
+    
+    # Download Settings
+    MAX_FILE_SIZE: int = 5 * 1024 * 1024 * 1024  # 5 GB
+    CHUNK_SIZE: int = 8192  # 8 KB chunks for streaming
+    DOWNLOAD_TIMEOUT: int = 3600  # 1 hour
+    TEMP_DOWNLOAD_DIR: str = "./downloads"
+    
+    # Rate Limiting
+    RATE_LIMIT_PER_MINUTE: int = 10
+    
+    class Config:
+        env_file = ".env"
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """Get cached settings instance."""
+    return Settings()

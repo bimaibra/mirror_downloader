@@ -369,6 +369,15 @@ class DownloadWorker:
                 except Exception as cleanup_error:
                     logger.warning(f"Failed to cleanup cancelled task file: {cleanup_error}")
             
+            # Clean up downloaded file if exists
+            if file_path and os.path.exists(file_path):
+                try:
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    os.remove(file_path)
+                    logger.info(f"Cleaned up file from cancelled task: {file_path} ({file_size_mb:.1f} MB freed)")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup cancelled task file: {cleanup_error}")
+            
             # Update task as cancelled
             self.task_manager.update_task(
                 task_id,
@@ -397,6 +406,15 @@ class DownloadWorker:
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Task {task_id} failed: {error_msg}", exc_info=True)
+            
+            # Clean up downloaded file if exists
+            if file_path and os.path.exists(file_path):
+                try:
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    os.remove(file_path)
+                    logger.info(f"Cleaned up file from failed task: {file_path} ({file_size_mb:.1f} MB freed)")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup failed task file: {cleanup_error}")
             
             # Clean up downloaded file if exists
             if file_path and os.path.exists(file_path):

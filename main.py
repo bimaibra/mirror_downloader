@@ -1,9 +1,11 @@
 """Main FastAPI application for Mirror Download Server - Admin Only."""
 import os
 import sys
+import json
 import asyncio
 import logging
 import subprocess
+from pathlib import Path
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -25,6 +27,7 @@ from task_manager import get_task_manager
 from worker import get_worker
 from services.telegram_service import get_telegram_service
 from services.gdrive_service import get_gdrive_service
+from services.gdrive_service import get_gdrive_service
 
 # Setup logging
 logging.basicConfig(
@@ -32,6 +35,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Constants for guest user limits
+GUEST_MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB max for guest users
 
 
 def authenticate_gdrive():
@@ -174,6 +180,12 @@ async def lifespan(app: FastAPI):
     
     # Create download directory
     os.makedirs(settings.TEMP_DOWNLOAD_DIR, exist_ok=True)
+    
+    # Cleanup files from cancelled/failed tasks first
+    try:
+        cleanup_cancelled_failed_tasks()
+    except Exception as e:
+        logger.warning(f"Cleanup cancelled/failed tasks failed: {e}")
     
     # Cleanup files from cancelled/failed tasks first
     try:
@@ -631,6 +643,14 @@ Please try again."""
             )
             return {"ok": True}
         
+        # Check ownership - guest users can only abort their own tasks
+        if not is_authorized(chat_id) and task.get('telegram_chat_id') != str(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="⚠️ <b>Access Denied</b>\n\nYou can only abort your own tasks."
+            )
+            return {"ok": True}
+        
         # Check if task can be cancelled
         if task['status'] not in ['pending', 'downloading', 'uploading']:
             await telegram.send_message(
@@ -694,6 +714,14 @@ The task has been cancelled (was not actively running).
             await telegram.send_message(
                 chat_id=chat_id,
                 message=f"❌ Task <code>{task_id}</code> not found"
+            )
+            return {"ok": True}
+        
+        # Check ownership - guest users can only view their own tasks
+        if not is_authorized(chat_id) and task.get('telegram_chat_id') != str(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="⚠️ <b>Access Denied</b>\n\nYou can only view your own tasks."
             )
             return {"ok": True}
         

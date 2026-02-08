@@ -250,6 +250,44 @@ class FileDownloader:
                     except Exception as e:
                         logger.warning(f"Failed to clean up partial file {partial_file}: {e}")
                 raise  # Re-raise the CancelledError
+            partial_file = None
+            try:
+                async with session.get(
+                    final_url,
+                    headers=self._get_browser_headers(),
+                    ssl=False,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    response.raise_for_status()
+                    
+                    downloaded = 0
+                    start_time = time.time()
+                    last_update = start_time
+                    partial_file = str(file_path)
+                    
+                    with open(file_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(self.settings.CHUNK_SIZE):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            current_time = time.time()
+                            elapsed = current_time - start_time
+                            
+                            if progress_callback and (current_time - last_update >= 1 or downloaded == total_size):
+                                speed_kbps = (downloaded / 1024) / elapsed if elapsed > 0 else 0
+                                progress_callback(downloaded, total_size, speed_kbps)
+                                last_update = current_time
+            
+            except asyncio.CancelledError:
+                # Clean up partial download
+                if partial_file and os.path.exists(partial_file):
+                    try:
+                        file_size = os.path.getsize(partial_file)
+                        os.remove(partial_file)
+                        logger.info(f"Cleaned up partial download: {partial_file} ({file_size} bytes)")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up partial file {partial_file}: {e}")
+                raise  # Re-raise the CancelledError
         
         # Result
         end_time = time.time()

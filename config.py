@@ -1,4 +1,4 @@
-"""Configuration module for the mirroring download server."""
+"""Configuration module for the mirroring download server - Admin Only."""
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -18,24 +18,13 @@ class Settings(BaseSettings):
     # Google Drive Configuration
     GOOGLE_CREDENTIALS_FILE: str = "credentials.json"
     GOOGLE_TOKEN_FILE: str = "token.json"
-    GDRIVE_FOLDER_ID: str = ""  # Optional: default folder ID
-    
-    # User Folder Separation (Opsi C)
-    GDRIVE_PUBLIC_FOLDER_ID: str = ""  # For guest users (no auth code)
-    GDRIVE_USERS_ROOT_FOLDER_ID: str = ""  # Root folder containing per-user folders
+    GDRIVE_FOLDER_ID: str = ""  # Default folder ID for admin downloads
     
     # Telegram Bot Configuration (optional)
     TELEGRAM_BOT_TOKEN: str = ""
-    TELEGRAM_ADMIN_CHAT_ID: str = ""
-    
-    # Bot Access Control
-    CODE_EXPIRY_HOURS: int = 24  # Access codes expire after N hours if not used (0 = never)
-    USER_ACCESS_DURATION_HOURS: int = 168  # How long users stay authorized after using code (0 = never expire, default 7 days)
-    MAX_CODES_PER_ADMIN: int = 10  # Max active codes per admin
+    TELEGRAM_ADMIN_CHAT_ID: str = ""  # Only this user can use the bot
     
     # Celery / Redis Configuration (for background tasks)
-    # For single server: install Redis locally
-    # For scaling: use Redis Cloud or separate Redis server
     REDIS_URL: str = "redis://localhost:6379/0"
     USE_CELERY: bool = False  # Set to True to enable Celery (requires Redis)
     

@@ -1,6 +1,7 @@
 # Local Development Guide
 
 Panduan menjalankan Mirror Download Server di komputer lokal (Windows/Mac/Linux).
+**Ini adalah private server - hanya admin yang bisa mengakses.**
 
 ## 🚀 Quick Start (Tanpa Celery - Simple)
 
@@ -104,8 +105,9 @@ API_KEY=test-key-local
 # Google Drive
 GOOGLE_CREDENTIALS_FILE=credentials.json
 GOOGLE_TOKEN_FILE=token.json
+GDRIVE_FOLDER_ID=              # Optional: default folder
 
-# Telegram (opsional - untuk notif)
+# Telegram (opsional - hanya admin)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ADMIN_CHAT_ID=
 

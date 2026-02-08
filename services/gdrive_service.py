@@ -209,6 +209,41 @@ class GoogleDriveService:
         folder = self.service.files().create(body=metadata, fields='id').execute()
         return folder.get('id')
     
+    def get_or_create_folder(self, folder_name: str, parent_id: Optional[str] = None) -> str:
+        """
+        Get existing folder or create new one if not exists.
+        
+        Args:
+            folder_name: Name of the folder
+            parent_id: Optional parent folder ID
+            
+        Returns:
+            Folder ID
+        """
+        # Build query to find folder
+        query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
+        
+        # Search for existing folder
+        results = self.service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        
+        files = results.get('files', [])
+        if files:
+            # Folder exists, return ID
+            folder_id = files[0]['id']
+            logger.info(f"Found existing folder '{folder_name}': {folder_id}")
+            return folder_id
+        
+        # Folder doesn't exist, create it
+        folder_id = self.create_folder(folder_name, parent_id)
+        logger.info(f"Created new folder '{folder_name}': {folder_id}")
+        return folder_id
+    
     def list_files(self, query: Optional[str] = None, page_size: int = 10) -> list:
         """List files in Google Drive."""
         results = self.service.files().list(

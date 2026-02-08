@@ -1,9 +1,11 @@
 """Main FastAPI application for Mirror Download Server."""
 import os
 import sys
+import json
 import asyncio
 import logging
 import subprocess
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +25,7 @@ from models import (
 from task_manager import get_task_manager
 from worker import get_worker
 from services.telegram_service import get_telegram_service
+from services.gdrive_service import get_gdrive_service
 
 # Setup logging
 logging.basicConfig(
@@ -30,6 +33,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Constants for guest user limits
+GUEST_MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB max for guest users
 
 
 def authenticate_gdrive():
@@ -113,6 +119,56 @@ def authenticate_gdrive():
         sys.exit(1)
 
 
+def cleanup_cancelled_failed_tasks():
+    """Clean up files from cancelled or failed tasks on startup."""
+    settings = get_settings()
+    task_manager = get_task_manager()
+    download_dir = Path(settings.TEMP_DOWNLOAD_DIR)
+    
+    if not download_dir.exists():
+        return
+    
+    # Get all tasks
+    all_tasks = task_manager.list_tasks(limit=10000)
+    
+    # Find cancelled or failed tasks
+    cancelled_failed_tasks = [
+        task for task in all_tasks 
+        if task['status'] in ['cancelled', 'failed']
+    ]
+    
+    deleted_count = 0
+    freed_bytes = 0
+    
+    for task in cancelled_failed_tasks:
+        # Try to find and delete associated files
+        # Files are typically named with task_id or contain the filename
+        filename = task.get('filename')
+        task_id = task['task_id']
+        
+        if filename:
+            # Look for files matching the task filename
+            for file_path in download_dir.iterdir():
+                if not file_path.is_file():
+                    continue
+                
+                # Check if file matches the task's filename
+                if file_path.name == filename or filename in file_path.name:
+                    try:
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()
+                        deleted_count += 1
+                        freed_bytes += file_size
+                        logger.info(f"Deleted file from {task['status']} task {task_id}: {file_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete file {file_path}: {e}")
+    
+    if deleted_count > 0:
+        logger.info(f"Cleanup cancelled/failed tasks: deleted {deleted_count} files, freed {freed_bytes / (1024*1024):.2f} MB")
+    else:
+        logger.info("No files to clean up from cancelled/failed tasks")
+
+
 # Startup and shutdown events
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -123,6 +179,12 @@ async def lifespan(app: FastAPI):
     
     # Create download directory
     os.makedirs(settings.TEMP_DOWNLOAD_DIR, exist_ok=True)
+    
+    # Cleanup files from cancelled/failed tasks first
+    try:
+        cleanup_cancelled_failed_tasks()
+    except Exception as e:
+        logger.warning(f"Cleanup cancelled/failed tasks failed: {e}")
     
     # Cleanup old downloaded files on startup (files older than 24 hours)
     try:
@@ -367,8 +429,180 @@ async def cancel_task(task_id: str, authorized: bool = Depends(verify_api_key)):
 
 # Bot Authorization System
 # Store authorized users and secret codes
-_authorized_users = set()  # Set of authorized chat IDs
+_authorized_users = {}  # Map of chat_id -> {authorized_at: timestamp, code: code_used}
 _secret_codes = {}  # Map of code -> {created_by, used_by, created_at, expires_at}
+_blocked_users = set()  # Set of blocked chat IDs
+_revoked_codes = set()  # Set of revoked (deactivated) codes
+_code_to_user = {}  # Map of code -> user_chat_id (for tracking which code was used by whom)
+
+# Persistence files
+_AUTHORIZED_USERS_FILE = Path("authorized_users.json")
+_BLOCKED_USERS_FILE = Path("blocked_users.json")
+_SECRET_CODES_FILE = Path("secret_codes.json")
+_CODE_TO_USER_FILE = Path("code_to_user.json")
+
+def _load_authorized_users():
+    """Load authorized users from persistence file."""
+    global _authorized_users
+    if _AUTHORIZED_USERS_FILE.exists():
+        try:
+            with open(_AUTHORIZED_USERS_FILE, 'r') as f:
+                data = json.load(f)
+                # Handle migration from old format (list) to new format (dict)
+                if isinstance(data, list):
+                    _authorized_users = {uid: {"authorized_at": datetime.now(timezone.utc).isoformat(), "code": None} for uid in data}
+                else:
+                    _authorized_users = data
+            logger.info(f"Loaded {len(_authorized_users)} authorized users")
+        except Exception as e:
+            logger.error(f"Failed to load authorized users: {e}")
+            _authorized_users = {}
+
+def _save_authorized_users():
+    """Save authorized users to persistence file."""
+    try:
+        with open(_AUTHORIZED_USERS_FILE, 'w') as f:
+            json.dump(_authorized_users, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save authorized users: {e}")
+
+def _is_user_access_expired(chat_id: str) -> bool:
+    """Check if user's access duration has expired."""
+    settings = get_settings()
+    if settings.USER_ACCESS_DURATION_HOURS <= 0:
+        return False  # Never expire
+    
+    chat_id_str = str(chat_id)
+    if chat_id_str not in _authorized_users:
+        return True  # Not authorized = expired
+    
+    user_data = _authorized_users[chat_id_str]
+    authorized_at = user_data.get("authorized_at")
+    
+    if not authorized_at:
+        return True
+    
+    try:
+        auth_time = datetime.fromisoformat(authorized_at)
+        if auth_time.tzinfo is None:
+            auth_time = auth_time.replace(tzinfo=timezone.utc)
+        
+        expires_at = auth_time + timedelta(hours=settings.USER_ACCESS_DURATION_HOURS)
+        now = datetime.now(timezone.utc)
+        
+        return now > expires_at
+    except Exception as e:
+        logger.error(f"Error checking user access expiry: {e}")
+        return False
+
+def _load_blocked_users():
+    """Load blocked users from persistence file."""
+    global _blocked_users
+    if _BLOCKED_USERS_FILE.exists():
+        try:
+            with open(_BLOCKED_USERS_FILE, 'r') as f:
+                data = json.load(f)
+                _blocked_users = set(data)
+            logger.info(f"Loaded {len(_blocked_users)} blocked users")
+        except Exception as e:
+            logger.error(f"Failed to load blocked users: {e}")
+            _blocked_users = set()
+
+def _save_blocked_users():
+    """Save blocked users to persistence file."""
+    try:
+        with open(_BLOCKED_USERS_FILE, 'w') as f:
+            json.dump(list(_blocked_users), f)
+    except Exception as e:
+        logger.error(f"Failed to save blocked users: {e}")
+
+def _load_secret_codes():
+    """Load secret codes from persistence file."""
+    global _secret_codes
+    if _SECRET_CODES_FILE.exists():
+        try:
+            with open(_SECRET_CODES_FILE, 'r') as f:
+                _secret_codes = json.load(f)
+            logger.info(f"Loaded {len(_secret_codes)} secret codes")
+        except Exception as e:
+            logger.error(f"Failed to load secret codes: {e}")
+            _secret_codes = {}
+
+def _save_secret_codes():
+    """Save secret codes to persistence file."""
+    try:
+        with open(_SECRET_CODES_FILE, 'w') as f:
+            json.dump(_secret_codes, f, default=str, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save secret codes: {e}")
+
+def _load_code_to_user():
+    """Load code-to-user mapping from persistence file."""
+    global _code_to_user
+    if _CODE_TO_USER_FILE.exists():
+        try:
+            with open(_CODE_TO_USER_FILE, 'r') as f:
+                _code_to_user = json.load(f)
+            logger.info(f"Loaded {len(_code_to_user)} code-to-user mappings")
+        except Exception as e:
+            logger.error(f"Failed to load code-to-user mappings: {e}")
+            _code_to_user = {}
+
+def _save_code_to_user():
+    """Save code-to-user mapping to persistence file."""
+    try:
+        with open(_CODE_TO_USER_FILE, 'w') as f:
+            json.dump(_code_to_user, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save code-to-user mappings: {e}")
+
+def cleanup_expired_authorizations():
+    """Remove authorized users whose codes have expired or been revoked."""
+    settings = get_settings()
+    removed_count = 0
+    
+    for code, user_id in list(_code_to_user.items()):
+        # Check if code exists
+        if code not in _secret_codes:
+            # Code doesn't exist anymore, remove user
+            if user_id in _authorized_users:
+                del _authorized_users[user_id]
+                removed_count += 1
+                logger.info(f"Removed user {user_id} - code {code} no longer exists")
+            del _code_to_user[code]
+            continue
+        
+        code_info = _secret_codes[code]
+        
+        # Check if code is revoked
+        if is_code_revoked(code) or code_info.get('used_by') == 'REVOKED':
+            if user_id in _authorized_users:
+                del _authorized_users[user_id]
+                removed_count += 1
+                logger.info(f"Removed user {user_id} - code {code} was revoked")
+            continue
+        
+        # Check if code is expired
+        if _is_code_expired(code_info):
+            if user_id in _authorized_users:
+                del _authorized_users[user_id]
+                removed_count += 1
+                logger.info(f"Removed user {user_id} - code {code} expired")
+            continue
+    
+    if removed_count > 0:
+        _save_authorized_users()
+        _save_code_to_user()
+        logger.info(f"Cleaned up {removed_count} expired/revoked authorizations")
+
+# Load persisted data on module load
+_load_authorized_users()
+_load_blocked_users()
+_load_secret_codes()
+_load_code_to_user()
+
+# Cleanup expired authorizations on startup
+cleanup_expired_authorizations()
 
 # WIB (Western Indonesian Time) is UTC+7
 WIB = timezone(timedelta(hours=7))
@@ -396,19 +630,50 @@ def _is_code_expired(code_info: dict) -> bool:
     if settings.CODE_EXPIRY_HOURS <= 0:
         return False  # Never expire
     
-    created = datetime.fromisoformat(code_info['created_at'])
+    created_str = code_info['created_at']
+    created = datetime.fromisoformat(created_str)
+    
+    # Ensure created is timezone-aware (UTC)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    
     expires = created + timedelta(hours=settings.CODE_EXPIRY_HOURS)
-    return datetime.utcnow() > expires
+    now = datetime.now(timezone.utc)
+    
+    return now > expires
 
 def _cleanup_expired_codes():
-    """Remove expired codes from the dict."""
+    """Remove expired codes from the dict and revoke access for users who used them."""
     expired = []
+    expired_used = []  # Codes that were used and now expired
+    
     for code, info in _secret_codes.items():
-        if _is_code_expired(info) and info['used_by'] is None:
-            expired.append(code)
+        if _is_code_expired(info):
+            if info['used_by'] is None:
+                expired.append(code)
+            elif info['used_by'] != 'REVOKED':
+                expired_used.append(code)
+    
+    # Remove unused expired codes
     for code in expired:
         del _secret_codes[code]
         logger.info(f"Expired code removed: {code}")
+    
+    # Remove access for users who used expired codes
+    for code in expired_used:
+        user_id = _secret_codes[code]['used_by']
+        if user_id in _authorized_users:
+            del _authorized_users[user_id]
+            logger.info(f"Removed user {user_id} access - code {code} expired")
+        if code in _code_to_user:
+            del _code_to_user[code]
+        # Mark as revoked so it won't be processed again
+        _secret_codes[code]['used_by'] = 'REVOKED'
+    
+    if expired or expired_used:
+        _save_secret_codes()
+        _save_authorized_users()
+        _save_code_to_user()
 
 def generate_secret_code(admin_chat_id: str) -> str:
     """Generate a new secret code for bot access."""
@@ -432,7 +697,7 @@ def generate_secret_code(admin_chat_id: str) -> str:
     # Generate 8-character code
     code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
     
-    created_at = datetime.utcnow()
+    created_at = datetime.now(timezone.utc)
     expires_at = None
     if settings.CODE_EXPIRY_HOURS > 0:
         expires_at = (created_at + timedelta(hours=settings.CODE_EXPIRY_HOURS)).isoformat()
@@ -443,30 +708,194 @@ def generate_secret_code(admin_chat_id: str) -> str:
         'created_at': created_at.isoformat(),
         'expires_at': expires_at
     }
+    _save_secret_codes()
     return code
 
 def is_authorized(chat_id: str) -> bool:
     """Check if user is authorized to use the bot."""
     settings = get_settings()
-    # Admin is always authorized
-    if chat_id == settings.TELEGRAM_ADMIN_CHAT_ID:
+    chat_id_str = str(chat_id)
+    
+    # Admin is always authorized (and can't be blocked)
+    if chat_id_str == settings.TELEGRAM_ADMIN_CHAT_ID:
         return True
-    return str(chat_id) in _authorized_users
+    
+    # Check if user is blocked
+    if chat_id_str in _blocked_users:
+        return False
+    
+    # Check if user is in authorized list
+    if chat_id_str not in _authorized_users:
+        return False
+    
+    # Check if user's access has expired
+    if _is_user_access_expired(chat_id_str):
+        # Remove from authorized (cleanup)
+        if chat_id_str in _authorized_users:
+            del _authorized_users[chat_id_str]
+            _save_authorized_users()
+            logger.info(f"Removed user {chat_id_str} - access duration expired")
+        return False
+    
+    return True
+
+def is_blocked(chat_id: str) -> bool:
+    """Check if user is blocked."""
+    return str(chat_id) in _blocked_users
+
+def check_previous_access(chat_id: str) -> Optional[str]:
+    """
+    Check if user previously had access that expired or was revoked.
+    Returns message to show user if applicable.
+    """
+    settings = get_settings()
+    chat_id_str = str(chat_id)
+    
+    # Check if user is currently not authorized
+    if is_authorized(chat_id):
+        return None
+    
+    # Check if user was in authorized list with data (had access before)
+    if chat_id_str in _authorized_users:
+        user_data = _authorized_users[chat_id_str]
+        auth_time = user_data.get("authorized_at")
+        if auth_time:
+            try:
+                auth_dt = datetime.fromisoformat(auth_time)
+                if auth_dt.tzinfo is None:
+                    auth_dt = auth_dt.replace(tzinfo=timezone.utc)
+                expires_dt = auth_dt + timedelta(hours=settings.USER_ACCESS_DURATION_HOURS)
+                now = datetime.now(timezone.utc)
+                
+                if now > expires_dt:
+                    return f"""
+⏰ <b>Access Duration Expired</b>
+
+Your access has expired after {settings.USER_ACCESS_DURATION_HOURS} hours.
+You are now back to guest mode with limits:
+• Max file size: 1 GB
+• Files go to: Public folder
+
+Contact admin for a new access code to restore full access.
+                    """.strip()
+            except Exception:
+                pass
+    
+    # Check if user was in code_to_user mapping (had access before)
+    for code, user_id in _code_to_user.items():
+        if user_id == chat_id_str:
+            # User had this code, check status
+            if code in _secret_codes:
+                code_info = _secret_codes[code]
+                if code_info.get('used_by') == 'REVOKED':
+                    return """
+⏰ <b>Access Code Revoked</b>
+
+Your access code has been revoked by admin.
+You are now back to guest mode with limits:
+• Max file size: 1 GB
+• Files go to: Public folder
+
+Contact admin for a new access code to restore full access.
+                    """.strip()
+                elif _is_code_expired(code_info):
+                    return """
+⏰ <b>Access Code Expired</b>
+
+Your access code has expired.
+You are now back to guest mode with limits:
+• Max file size: 1 GB
+• Files go to: Public folder
+
+Contact admin for a new access code to restore full access.
+                    """.strip()
+    
+    return None
+
+def block_user(chat_id: str) -> bool:
+    """Block a user from using the bot."""
+    chat_id_str = str(chat_id)
+    if chat_id_str not in _blocked_users:
+        _blocked_users.add(chat_id_str)
+        _save_blocked_users()
+        # Also remove from authorized if they were authorized
+        if chat_id_str in _authorized_users:
+            del _authorized_users[chat_id_str]
+            _save_authorized_users()
+        logger.info(f"User {chat_id} has been blocked")
+        return True
+    return False
+
+def unblock_user(chat_id: str) -> bool:
+    """Unblock a user."""
+    chat_id_str = str(chat_id)
+    if chat_id_str in _blocked_users:
+        _blocked_users.discard(chat_id_str)
+        _save_blocked_users()
+        logger.info(f"User {chat_id} has been unblocked")
+        return True
+    return False
+
+def revoke_code(code: str) -> bool:
+    """Revoke (deactivate) an access code and remove associated user access."""
+    if code in _secret_codes:
+        # Get the user who used this code
+        user_id = _secret_codes[code].get('used_by')
+        
+        # Revoke the code
+        _revoked_codes.add(code)
+        _secret_codes[code]['used_by'] = 'REVOKED'
+        
+        # Remove user from authorized if they used this code
+        if user_id and user_id != 'REVOKED' and user_id in _authorized_users:
+            del _authorized_users[user_id]
+            logger.info(f"Removed user {user_id} access - code {code} revoked")
+        
+        # Clean up code-to-user mapping
+        if code in _code_to_user:
+            del _code_to_user[code]
+        
+        _save_secret_codes()
+        _save_authorized_users()
+        _save_code_to_user()
+        logger.info(f"Code {code} has been revoked")
+        return True
+    return False
+
+def is_code_revoked(code: str) -> bool:
+    """Check if a code has been revoked."""
+    return code in _revoked_codes
 
 def authorize_user(chat_id: str, code: str) -> bool:
     """Authorize a user with a secret code."""
     _cleanup_expired_codes()
     
+    # Check if user is blocked
+    if is_blocked(chat_id):
+        return False
+    
     if code in _secret_codes:
         code_info = _secret_codes[code]
+        
+        # Check if code is revoked
+        if is_code_revoked(code):
+            return False
         
         # Check if expired
         if _is_code_expired(code_info):
             return False
         
         if code_info['used_by'] is None:
-            code_info['used_by'] = chat_id
-            _authorized_users.add(str(chat_id))
+            chat_id_str = str(chat_id)
+            _secret_codes[code]['used_by'] = chat_id
+            _authorized_users[chat_id_str] = {
+                "authorized_at": datetime.now(timezone.utc).isoformat(),
+                "code": code
+            }
+            _code_to_user[code] = chat_id_str  # Track which code was used by this user
+            _save_authorized_users()
+            _save_secret_codes()
+            _save_code_to_user()
             return True
     return False
 
@@ -516,27 +945,36 @@ async def telegram_webhook(update: dict):
 Send me a direct download link and I'll upload it to Google Drive for you!
 
 <b>Commands:</b>
-• /status &lt;task_id&gt; - Check task status with progress bar
+• /status &lt;task_id&gt; - Check task status
 • /abort &lt;task_id&gt; - Cancel a running task{admin_hint}
 
 Just paste any URL to start downloading.
                 """.strip()
             )
         else:
-            # Show unauthorized user menu
+            # Show guest user menu (public access)
             await telegram.send_message(
                 chat_id=chat_id,
                 message=f"""
 🤖 <b>Mirror Download Bot</b>
 
-⚠️ <b>Authorization Required</b>
+👋 <b>Welcome Guest!</b>
 
-This bot is private. You need an access code to use it.
+You can download files directly without registration!
 
-<b>To get access:</b>
-1. Contact the admin
-2. Request an access code
-3. Send: <code>/auth YOUR_CODE</code>
+<b>Limits:</b>
+• 📦 Max file size: <b>1 GB</b>
+• 📁 Files go to: <b>Public folder</b>
+
+<b>To download:</b>
+Just paste any direct download link!
+/abort &lt;task_id&gt; - Cancel a running task
+/status &lt;task_id&gt; - Check task status
+
+<b>To unlock more features:</b>
+1. Contact admin for access code
+2. Send: <code>/auth YOUR_CODE</code>
+3. Enjoy higher limits & personal folder!
 
 <i>Example: /auth ABC12345</i>
                 """.strip()
@@ -545,6 +983,20 @@ This bot is private. You need an access code to use it.
     
     # /auth command - authorize with code
     if text.startswith('/auth'):
+        # Check if user is blocked
+        if is_blocked(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="""
+🚫 <b>Access Blocked</b>
+
+Your account has been blocked from using this bot.
+
+Contact admin for more information.
+                """.strip()
+            )
+            return {"ok": True}
+        
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             await telegram.send_message(
@@ -554,6 +1006,20 @@ This bot is private. You need an access code to use it.
             return {"ok": True}
         
         code = parts[1].strip().upper()
+        
+        # Check if code is revoked
+        if is_code_revoked(code):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="""
+❌ <b>Code Revoked</b>
+
+This access code has been deactivated by admin.
+
+Contact admin for a new code.
+                """.strip()
+            )
+            return {"ok": True}
         
         # Check if code exists and get info
         code_info = get_code_info(code)
@@ -591,6 +1057,7 @@ Send me any download link to get started!
 The code you entered is either:
 • Incorrect
 • Already used by someone else
+• Has been revoked by admin
 
 Contact admin for a new code.
                 """.strip()
@@ -611,7 +1078,8 @@ Contact admin for a new code.
             
             expiry_info = ""
             if settings.CODE_EXPIRY_HOURS > 0:
-                expires_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                # Calculate actual expiry time (now + expiry hours)
+                expires_utc = datetime.now(timezone.utc) + timedelta(hours=settings.CODE_EXPIRY_HOURS)
                 expires_wib = to_wib(expires_utc)
                 expiry_info = f"\n⏰ Expires: <code>{expires_wib.strftime('%Y-%m-%d %H:%M')} WIB</code>"
             else:
@@ -657,10 +1125,16 @@ Send <code>/codes</code> to see all codes.
 <b>Access Control:</b>
 • /gencode - Generate new access code
 • /codes - List all access codes
+• /revoke &lt;CODE&gt; - Revoke an access code
 
-<b>Bot Management:</b>
-• /start - Start bot
+<b>User Management:</b>
+• /users - List all users with stats
+• /block &lt;chat_id&gt; - Block a user
+• /unblock &lt;chat_id&gt; - Unblock a user
+
+<b>Task Management:</b>
 • /status &lt;task_id&gt; - Check task status
+• /abort &lt;task_id&gt; - Cancel a task
 
 <b>Configuration:</b>
 • /settings - View/change bot settings
@@ -872,23 +1346,413 @@ Send <code>/codes</code> to see all codes.
         )
         return {"ok": True}
     
-    # Check authorization for all other commands
-    if not is_authorized(chat_id):
-        logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
+    # /users command - admin only, list all authorized users
+    if text == '/users':
+        if chat_id != settings.TELEGRAM_ADMIN_CHAT_ID:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ This command is for admin only."
+            )
+            return {"ok": True}
+        
+        # Get all tasks to extract user activity
+        task_manager = get_task_manager()
+        all_tasks = task_manager.list_tasks(limit=1000)
+        
+        # Build user stats from tasks
+        user_stats = {}
+        for task in all_tasks:
+            user_id = task.get('telegram_chat_id')
+            if not user_id:
+                continue
+            
+            if user_id not in user_stats:
+                user_stats[user_id] = {
+                    'total': 0,
+                    'completed': 0,
+                    'failed': 0,
+                    'last_active': task.get('created_at')
+                }
+            
+            user_stats[user_id]['total'] += 1
+            if task['status'] == 'completed':
+                user_stats[user_id]['completed'] += 1
+            elif task['status'] == 'failed':
+                user_stats[user_id]['failed'] += 1
+        
+        # Build message
+        msg_lines = ["👥 <b>Authorized Users</b>\n"]
+        
+        if not _authorized_users:
+            msg_lines.append("No authorized users yet.")
+        else:
+            for user_id in sorted(_authorized_users):
+                stats = user_stats.get(user_id, {})
+                total = stats.get('total', 0)
+                completed = stats.get('completed', 0)
+                failed = stats.get('failed', 0)
+                last_active = stats.get('last_active', 'Never')
+                
+                # Check if blocked
+                if is_blocked(user_id):
+                    status = "🚫 BLOCKED"
+                else:
+                    status = "✅ Active"
+                
+                msg_lines.append(
+                    f"<code>{user_id}</code>\n"
+                    f"  {status} | Downloads: {total} ({completed}✓ {failed}✗)\n"
+                    f"  Last: {format_wib(last_active) if last_active != 'Never' else 'Never'}\n"
+                )
+        
+        # Show blocked users separately
+        if _blocked_users:
+            msg_lines.append("\n🚫 <b>Blocked Users:</b>")
+            for blocked_id in sorted(_blocked_users):
+                stats = user_stats.get(blocked_id, {})
+                total = stats.get('total', 0)
+                msg_lines.append(f"  <code>{blocked_id}</code> ({total} downloads)")
+        
+        msg_lines.append(f"\n📊 Total: {len(_authorized_users)} users, {len(_blocked_users)} blocked")
+        
         await telegram.send_message(
             chat_id=chat_id,
-            message="""
-⚠️ <b>Not Authorized</b>
-
-You need to authenticate first.
-Send: <code>/auth YOUR_CODE</code>
-
-Or contact admin for access.
-            """.strip()
+            message="\n".join(msg_lines)
         )
         return {"ok": True}
     
-    # /abort command - cancel a running task
+    # /block command - admin only, block a user
+    if text.startswith('/block'):
+        if chat_id != settings.TELEGRAM_ADMIN_CHAT_ID:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ This command is for admin only."
+            )
+            return {"ok": True}
+        
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Usage: <code>/block &lt;chat_id&gt;</code>\n\nExample: <code>/block 123456789</code>"
+            )
+            return {"ok": True}
+        
+        target_id = parts[1].strip()
+        
+        # Prevent blocking admin
+        if target_id == settings.TELEGRAM_ADMIN_CHAT_ID:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ You cannot block yourself (admin)."
+            )
+            return {"ok": True}
+        
+        if block_user(target_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"🚫 User <code>{target_id}</code> has been blocked.\n\nThey can no longer use the bot."
+            )
+        else:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"⚠️ User <code>{target_id}</code> is already blocked."
+            )
+        return {"ok": True}
+    
+    # /unblock command - admin only, unblock a user
+    if text.startswith('/unblock'):
+        if chat_id != settings.TELEGRAM_ADMIN_CHAT_ID:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ This command is for admin only."
+            )
+            return {"ok": True}
+        
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Usage: <code>/unblock &lt;chat_id&gt;</code>\n\nExample: <code>/unblock 123456789</code>"
+            )
+            return {"ok": True}
+        
+        target_id = parts[1].strip()
+        
+        if unblock_user(target_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"✅ User <code>{target_id}</code> has been unblocked.\n\nThey can now use the bot again."
+            )
+        else:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"⚠️ User <code>{target_id}</code> was not blocked."
+            )
+        return {"ok": True}
+    
+    # /revoke command - admin only, revoke an access code
+    if text.startswith('/revoke'):
+        if chat_id != settings.TELEGRAM_ADMIN_CHAT_ID:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ This command is for admin only."
+            )
+            return {"ok": True}
+        
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Usage: <code>/revoke &lt;CODE&gt;</code>\n\nExample: <code>/revoke ABC12345</code>"
+            )
+            return {"ok": True}
+        
+        code = parts[1].strip().upper()
+        
+        if revoke_code(code):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"🚫 Code <code>{code}</code> has been revoked.\n\nIt can no longer be used."
+            )
+        else:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"❌ Code <code>{code}</code> not found."
+            )
+        return {"ok": True}
+    
+    # URL detection (direct link sent) - ALLOWED for guest users
+    if text.startswith(('http://', 'https://')):
+        # Check if user is blocked
+        if is_blocked(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="""
+🚫 <b>Access Blocked</b>
+
+Your account has been blocked from using this bot.
+
+Contact admin for more information.
+                """.strip()
+            )
+            return {"ok": True}
+        
+        # Check if user previously had access that expired/revoked
+        access_expired_msg = check_previous_access(chat_id)
+        if access_expired_msg:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=access_expired_msg
+            )
+        
+        import re
+        # Extract URL (handle URLs with spaces encoded as %20)
+        url_match = re.match(r'(https?://\S+)', text)
+        if not url_match:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ <b>Invalid URL format</b>\n\nCould not parse the URL."
+            )
+            return {"ok": True}
+        
+        url = url_match.group(1)
+        logger.info(f"Processing URL from Telegram: {url}")
+        
+        # Validate URL
+        try:
+            downloader = FileDownloader()
+            info = await downloader.get_file_info(url)
+            
+            # Check file size limit for guest users (not authorized)
+            is_user_authorized = is_authorized(chat_id)
+            file_size = info.get('size', 0) or 0
+            
+            if not is_user_authorized and file_size > GUEST_MAX_FILE_SIZE:
+                await telegram.send_message(
+                    chat_id=chat_id,
+                    message=f"""
+❌ <b>File Too Large for Guest</b>
+
+📄 <b>File:</b> <code>{info['filename']}</code>
+📦 <b>Size:</b> {info['size_human']}
+🚫 <b>Guest Limit:</b> 1 GB
+
+<b>To download larger files:</b>
+1. Get an access code from admin
+2. Send: <code>/auth YOUR_CODE</code>
+3. Then send the URL again
+                    """.strip()
+                )
+                return {"ok": True}
+            
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"""
+📥 <b>Starting Download...</b>
+
+📄 <b>File:</b> <code>{info['filename']}</code>
+📦 <b>Size:</b> {info['size_human']}
+📋 <b>Type:</b> {info['content_type']}
+
+⏳ Queuing download...
+                """.strip()
+            )
+            
+            # Determine folder based on user authentication status
+            task_manager = get_task_manager()
+            settings = get_settings()
+            folder_id = None
+            folder_type_msg = ""
+            
+            # Initialize Google Drive service for folder creation
+            gdrive = get_gdrive_service()
+            
+            if is_user_authorized:
+                # Authenticated user - use/create personal folder
+                user_folder_id = task_manager.get_user_folder(str(chat_id))
+                
+                if user_folder_id:
+                    # User already has a folder
+                    folder_id = user_folder_id
+                    folder_type_msg = "Folder: Personal"
+                else:
+                    # Create new folder for this user
+                    try:
+                        # Get or create users root folder
+                        if settings.GDRIVE_USERS_ROOT_FOLDER_ID:
+                            users_root_id = settings.GDRIVE_USERS_ROOT_FOLDER_ID
+                        else:
+                            # Auto-create users root folder
+                            users_root_id = gdrive.get_or_create_folder("Users")
+                        
+                        folder_name = f"User_{chat_id}"
+                        user_folder_id = gdrive.create_folder(
+                            folder_name=folder_name,
+                            parent_id=users_root_id
+                        )
+                        task_manager.set_user_folder(str(chat_id), user_folder_id)
+                        folder_id = user_folder_id
+                        folder_type_msg = "Folder: Personal (new)"
+                        logger.info(f"Created personal folder for user {chat_id}: {user_folder_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to create user folder: {e}")
+                        # Fallback to public folder
+                        try:
+                            if settings.GDRIVE_PUBLIC_FOLDER_ID:
+                                folder_id = settings.GDRIVE_PUBLIC_FOLDER_ID
+                            else:
+                                folder_id = gdrive.get_or_create_folder("Public")
+                            folder_type_msg = "Folder: Public"
+                        except Exception as e2:
+                            logger.error(f"Fallback folder creation failed: {e2}")
+                            folder_id = None
+                            folder_type_msg = "Folder: Root (fallback)"
+            else:
+                # Guest user - use/create public folder
+                try:
+                    if settings.GDRIVE_PUBLIC_FOLDER_ID:
+                        folder_id = settings.GDRIVE_PUBLIC_FOLDER_ID
+                    else:
+                        # Auto-create public folder
+                        folder_id = gdrive.get_or_create_folder("Public")
+                    folder_type_msg = "Folder: Public"
+                except Exception as e:
+                    logger.error(f"Failed to create public folder: {e}")
+                    folder_id = None
+                    folder_type_msg = "Folder: Root (fallback)"
+            
+            # Create task
+            worker = get_worker()
+            
+            task_id = task_manager.create_task(
+                url=url,
+                filename=info['filename'],
+                folder_id=folder_id,
+                telegram_chat_id=str(chat_id)
+            )
+            
+            worker.queue_task(task_id)
+            
+            await telegram.send_message(
+                chat_id=chat_id,
+                message=f"""
+✅ <b>Download Queued!</b>
+
+🆔 Task ID: <code>{task_id}</code>
+{folder_type_msg}
+
+⏱️ I'll notify you when it's ready!
+                """.strip()
+            )
+            return {"ok": True}
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Failed to process URL {url}: {error_msg}", exc_info=True)
+            
+            # Provide user-friendly error messages based on error type
+            if "Could not find" in error_msg or "downloadable file" in error_msg.lower():
+                user_message = """❌ <b>Download Link Not Found</b>
+
+Could not find a direct download link in this URL.
+
+<b>Possible reasons:</b>
+• Link expired or requires login
+• Site uses JavaScript to generate download link
+• Anti-bot protection (CAPTCHA, etc.)
+• Premium account required
+
+<b>Solutions:</b>
+1. Try accessing the link in browser first
+2. Use the direct download URL (not the page URL)
+3. Some file hosts block automated downloads"""
+            
+            elif "ClientConnectorError" in error_msg or "Cannot connect" in error_msg:
+                user_message = f"""❌ <b>Cannot Connect to Server</b>
+
+The server might be:
+• Down or unreachable
+• Blocking your region/IP
+• Rate-limiting requests
+
+<code>{error_msg[:150]}</code>"""
+            
+            elif "403" in error_msg or "Forbidden" in error_msg:
+                user_message = """❌ <b>Access Denied (403)</b>
+
+Server blocked the request.
+
+<b>Common causes:</b>
+• Missing Referer header
+• Anti-bot protection
+• IP blocked
+• Requires premium account
+
+<b>Try:</b>
+• Use direct link from browser's download manager
+• Different file host"""
+            
+            elif "404" in error_msg or "Not Found" in error_msg:
+                user_message = """❌ <b>File Not Found (404)</b>
+
+The file doesn't exist at this URL.
+It may have been deleted or moved."""
+            else:
+                user_message = f"""❌ <b>Failed to Process URL</b>
+
+<code>{error_msg[:200]}</code>
+
+Please try again or contact admin."""
+            
+            await telegram.send_message(chat_id=chat_id, message=user_message)
+            return {"ok": True}
+    
+    # Helper function to check if user owns the task
+    def _owns_task(task, user_chat_id: str) -> bool:
+        return task.get('telegram_chat_id') == user_chat_id
+    
+    # /abort command - cancel a running task (allowed for task owners including guests)
     if text.startswith('/abort'):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -906,6 +1770,14 @@ Or contact admin for access.
             await telegram.send_message(
                 chat_id=chat_id,
                 message=f"❌ Task <code>{task_id}</code> not found"
+            )
+            return {"ok": True}
+        
+        # Check ownership - guest users can only abort their own tasks
+        if not is_authorized(chat_id) and task.get('telegram_chat_id') != str(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="⚠️ <b>Access Denied</b>\n\nYou can only abort your own tasks."
             )
             return {"ok": True}
         
@@ -954,7 +1826,7 @@ The task has been cancelled (was not actively running).
             )
         return {"ok": True}
     
-    # /status command (requires auth)
+    # /status command (allowed for task owners including guests)
     if text.startswith('/status'):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -975,6 +1847,14 @@ The task has been cancelled (was not actively running).
             )
             return {"ok": True}
         
+        # Check ownership - guest users can only view their own tasks
+        if not is_authorized(chat_id) and task.get('telegram_chat_id') != str(chat_id):
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="⚠️ <b>Access Denied</b>\n\nYou can only view your own tasks."
+            )
+            return {"ok": True}
+        
         status_emoji = {
             'pending': '⏳',
             'downloading': '⬇️',
@@ -990,7 +1870,7 @@ The task has been cancelled (was not actively running).
             empty = length - filled
             return '█' * filled + '░' * empty
         
-        # Build visual status message with progress bar
+        # Build visual status message
         progress = task.get('progress', 0) or 0
         progress_bar = create_progress_bar(progress)
         
@@ -1076,130 +1956,23 @@ The task has been cancelled (was not actively running).
             """.strip()
         
         await telegram.send_message(chat_id=chat_id, message=msg)
+        return {"ok": True}
     
-    # URL detection (direct link sent)
-    elif text.startswith(('http://', 'https://')):
-        import re
-        # Extract URL (handle URLs with spaces encoded as %20)
-        url_match = re.match(r'(https?://\S+)', text)
-        if not url_match:
-            await telegram.send_message(
-                chat_id=chat_id,
-                message="❌ <b>Invalid URL format</b>\n\nCould not parse the URL."
-            )
-            return {"ok": True}
-        
-        url = url_match.group(1)
-        logger.info(f"Processing URL from Telegram: {url}")
-        
-        # Validate URL
-        try:
-            downloader = FileDownloader()
-            info = await downloader.get_file_info(url)
-            
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
-📥 <b>Starting Download...</b>
+    # Check authorization for all other commands (admin commands, etc.)
+    if not is_authorized(chat_id):
+        logger.warning(f"Unauthorized access attempt from chat_id: {chat_id}")
+        await telegram.send_message(
+            chat_id=chat_id,
+            message="""
+⚠️ <b>Not Authorized</b>
 
-📄 <b>File:</b> <code>{info['filename']}</code>
-📦 <b>Size:</b> {info['size_human']}
-📋 <b>Type:</b> {info['content_type']}
+You need to authenticate first.
+Send: <code>/auth YOUR_CODE</code>
 
-⏳ Queuing download...
-                """.strip()
-            )
-            
-            # Create task
-            task_manager = get_task_manager()
-            worker = get_worker()
-            
-            task_id = task_manager.create_task(
-                url=url,
-                filename=info['filename'],
-                telegram_chat_id=str(chat_id)
-            )
-            
-            worker.queue_task(task_id)
-            
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
-✅ <b>Download Queued!</b>
-
-🆔 Task ID: <code>{task_id}</code>
-
-⏱️ I'll notify you when it's ready!
-                """.strip()
-            )
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to process URL {url}: {error_msg}", exc_info=True)
-            
-            # Provide user-friendly error messages based on error type
-            if "Could not find" in error_msg or "downloadable file" in error_msg.lower():
-                user_message = """❌ <b>Download Link Not Found</b>
-
-Could not find a direct download link in this URL.
-
-<b>Possible reasons:</b>
-• Link expired or requires login
-• Site uses JavaScript to generate download link
-• Anti-bot protection (CAPTCHA, etc.)
-• Premium account required
-
-<b>Solutions:</b>
-1. Try accessing the link in browser first
-2. Use the direct download URL (not the page URL)
-3. Some file hosts block automated downloads"""
-            
-            elif "ClientConnectorError" in error_msg or "Cannot connect" in error_msg:
-                user_message = f"""❌ <b>Cannot Connect to Server</b>
-
-The server might be:
-• Down or unreachable
-• Blocking your region/IP
-• Rate-limiting requests
-
-<code>{error_msg[:150]}</code>"""
-            
-            elif "403" in error_msg or "Forbidden" in error_msg:
-                user_message = """❌ <b>Access Denied (403)</b>
-
-Server blocked the request.
-
-<b>Common causes:</b>
-• Missing Referer header
-• Anti-bot protection
-• IP blocked
-• Requires premium account
-
-<b>Try:</b>
-• Use direct link from browser's download manager
-• Different file host"""
-            
-            elif "404" in error_msg or "Not Found" in error_msg:
-                user_message = """❌ <b>File Not Found (404)</b>
-
-The file doesn't exist at this URL.
-It may have been deleted or moved."""
-            else:
-                user_message = f"""❌ <b>Failed to Process URL</b>
-
-Could not download from this URL.
-
-Error: <code>{error_msg[:200]}</code>
-
-Common issues:
-• Link expired
-• Requires browser cookies
-• Anti-bot protection"""
-            
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=user_message
-            )
+Or contact admin for access.
+            """.strip()
+        )
+        return {"ok": True}
     
     # Unknown command
     elif text.startswith('/'):

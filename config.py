@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 10
+
+    # Code/User Management
+    CODE_EXPIRY_HOURS: int = 24
+    USER_ACCESS_DURATION_HOURS: int = 168
+    MAX_CODES_PER_ADMIN: int = 10
     
     class Config:
         env_file = ".env"

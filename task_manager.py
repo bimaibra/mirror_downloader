@@ -1,4 +1,4 @@
-"""Task manager for tracking download tasks."""
+"""Task manager for tracking download tasks - Admin Only."""
 import uuid
 import json
 import logging
@@ -15,14 +15,11 @@ logger = logging.getLogger(__name__)
 class TaskManager:
     """In-memory task manager with optional persistence."""
     
-    def __init__(self, persistence_file: str = "tasks.json", user_folders_file: str = "user_folders.json"):
+    def __init__(self, persistence_file: str = "tasks.json"):
         self.tasks: Dict[str, dict] = {}
         self.persistence_file = Path(persistence_file)
-        self.user_folders_file = Path(user_folders_file)
-        self.user_folders: Dict[str, str] = {}  # chat_id -> folder_id mapping
         self.lock = Lock()
         self._load_tasks()
-        self._load_user_folders()
     
     def _load_tasks(self):
         """Load tasks from persistence file."""
@@ -35,37 +32,6 @@ class TaskManager:
             except Exception as e:
                 logger.error(f"Failed to load tasks: {e}")
                 self.tasks = {}
-    
-    def _load_user_folders(self):
-        """Load user folder mappings from persistence file."""
-        if self.user_folders_file.exists():
-            try:
-                with open(self.user_folders_file, 'r') as f:
-                    self.user_folders = json.load(f)
-                logger.info(f"Loaded {len(self.user_folders)} user folder mappings")
-            except Exception as e:
-                logger.error(f"Failed to load user folders: {e}")
-                self.user_folders = {}
-    
-    def _save_user_folders(self):
-        """Save user folder mappings to persistence file."""
-        try:
-            with open(self.user_folders_file, 'w') as f:
-                json.dump(self.user_folders, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save user folders: {e}")
-    
-    def get_user_folder(self, chat_id: str) -> Optional[str]:
-        """Get user's personal folder ID. Returns None if not created yet."""
-        with self.lock:
-            return self.user_folders.get(chat_id)
-    
-    def set_user_folder(self, chat_id: str, folder_id: str):
-        """Save user's personal folder ID."""
-        with self.lock:
-            self.user_folders[chat_id] = folder_id
-            self._save_user_folders()
-            logger.info(f"Saved folder {folder_id} for user {chat_id}")
     
     def _save_tasks(self):
         """Save tasks to persistence file."""

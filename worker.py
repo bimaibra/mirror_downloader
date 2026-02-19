@@ -3,13 +3,16 @@ import os
 import asyncio
 import logging
 import time
+import shutil
 import httpx
+from pathlib import Path
 from typing import Optional, Dict
 
 from config import get_settings
 from models import DownloadStatus, NotificationPayload
 from task_manager import get_task_manager
 from services import FileDownloader, get_gdrive_service, get_telegram_service
+from services.torrent_service import get_torrent_service
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,7 @@ class DownloadWorker:
         self.settings = get_settings()
         self.task_manager = get_task_manager()
         self.downloader = FileDownloader()
+        self.torrent_service = get_torrent_service()
         self.gdrive = None  # Lazy init
         self.telegram = None  # Lazy init
         self._running = False
@@ -152,6 +156,22 @@ class DownloadWorker:
                 logger.info(f"Webhook sent to {callback_url}")
         except Exception as e:
             logger.error(f"Failed to send webhook: {e}")
+
+    def _cleanup_path(self, path: Optional[str], context: str):
+        """Helper to clean up a file or directory."""
+        if not path:
+            return
+
+        try:
+            if os.path.exists(path):
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    logger.info(f"Cleaned up directory {path} for {context}")
+                else:
+                    os.remove(path)
+                    logger.info(f"Cleaned up file {path} for {context}")
+        except Exception as e:
+            logger.error(f"Failed to clean up {path} for {context}: {e}")
     
     async def process_task(self, task_id: str):
         """Process a single download task."""
@@ -214,21 +234,27 @@ class DownloadWorker:
                 telegram_chat_id=telegram_chat_id, 
                 filename=filename or "unknown"
             )
-            download_result = await self.downloader.download(
-                url=url,
-                filename=filename,
-                progress_callback=progress_cb
-            )
+            
+            # Check if it's a torrent/magnet
+            if url.startswith('magnet:') or url.endswith('.torrent'):
+                logger.info(f"Processing torrent for task {task_id}")
+                download_result = await self.torrent_service.download_torrent(
+                    link=url,
+                    save_path=self.settings.TEMP_DOWNLOAD_DIR,
+                    progress_callback=progress_cb
+                )
+            else:
+                download_result = await self.downloader.download(
+                    url=url,
+                    filename=filename,
+                    progress_callback=progress_cb
+                )
             
             # Check if task was cancelled after download
             if self.is_task_cancelled(task_id):
                 logger.info(f"Task {task_id} was cancelled after download, cleaning up")
                 # Clean up downloaded file
-                try:
-                    if os.path.exists(download_result['file_path']):
-                        os.remove(download_result['file_path'])
-                except:
-                    pass
+                self._cleanup_path(download_result['file_path'], f"cancelled task {task_id} after download")
                 raise asyncio.CancelledError("Task cancelled by user")
             
             file_path = download_result['file_path']
@@ -247,8 +273,7 @@ class DownloadWorker:
             # Check if task was cancelled before upload
             if self.is_task_cancelled(task_id):
                 logger.info(f"Task {task_id} was cancelled before upload, cleaning up")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+                self._cleanup_path(file_path, f"cancelled task {task_id} before upload")
                 raise asyncio.CancelledError("Task cancelled by user")
             
             # Upload to Google Drive
@@ -270,21 +295,19 @@ class DownloadWorker:
             # Check if task was cancelled right before upload starts
             if self.is_task_cancelled(task_id):
                 logger.info(f"Task {task_id} was cancelled before upload starts, cleaning up")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+                self._cleanup_path(file_path, f"cancelled task {task_id} before upload starts")
                 raise asyncio.CancelledError("Task cancelled by user")
             
             # Create upload progress callback
             last_upload_progress = 0
-            upload_start_time = time.time()
+            last_upload_time = time.time()
             
             def upload_progress_callback(uploaded_bytes: int, total_bytes: int):
-                nonlocal last_upload_progress
+                nonlocal last_upload_progress, last_upload_time
                 if total_bytes > 0:
                     progress = (uploaded_bytes / total_bytes) * 100
-                    # Update Telegram every 5% progress or every 5 seconds
                     current_time = time.time()
-                    time_since_last = current_time - upload_start_time
+                    time_since_last = current_time - last_upload_time
                     if progress - last_upload_progress >= 5 or time_since_last >= 5:
                         if telegram_chat_id:
                             asyncio.create_task(
@@ -296,19 +319,84 @@ class DownloadWorker:
                                 )
                             )
                         last_upload_progress = progress
+                        last_upload_time = current_time
             
-            # Run upload in thread pool (blocking operation)
+            # Handle upload (Directory vs Single File)
             loop = asyncio.get_event_loop()
-            gdrive_result = await loop.run_in_executor(
-                None,
-                lambda: self.gdrive.upload_file(
-                    file_path=file_path,
-                    filename=actual_filename,
-                    folder_id=folder_id,
-                    description=f"Downloaded from: {url}",
-                    progress_callback=upload_progress_callback if telegram_chat_id else None
+            gdrive_result = None
+
+            if os.path.exists(file_path) and os.path.isdir(file_path):
+                logger.info(f"Task {task_id}: Path is a directory, uploading recursively: {file_path}")
+                
+                def upload_recursive(current_path, parent_id=None, is_root=False):
+                    folder_name = os.path.basename(current_path)
+                    
+                    # Update status
+                    if is_root:
+                        self.task_manager.update_task(
+                            task_id,
+                            status=DownloadStatus.UPLOADING,
+                            message=f"Creating folder: {folder_name}"
+                        )
+                    
+                    # Create folder
+                    remote_folder_id = self.gdrive.create_folder(folder_name, parent_id)
+                    
+                    # Make public if root
+                    if is_root:
+                         try:
+                             self.gdrive._make_file_public(remote_folder_id)
+                         except Exception:
+                             pass
+                    
+                    items = sorted(os.listdir(current_path))
+                    total_items = len(items)
+                    
+                    for index, item in enumerate(items):
+                        item_path = os.path.join(current_path, item)
+                        
+                        if is_root:
+                             self.task_manager.update_task(
+                                task_id,
+                                status=DownloadStatus.UPLOADING,
+                                message=f"Processing {index+1}/{total_items}: {item}"
+                            )
+
+                        if os.path.isdir(item_path):
+                            upload_recursive(item_path, remote_folder_id, is_root=False)
+                        else:
+                            self.gdrive.upload_file(
+                                file_path=item_path,
+                                filename=item,
+                                folder_id=remote_folder_id,
+                                description=f"Part of {actual_filename}"
+                            )
+                            
+                    return {
+                        'id': remote_folder_id, 
+                        'webViewLink': f"https://drive.google.com/drive/folders/{remote_folder_id}"
+                    }
+
+                gdrive_result = await loop.run_in_executor(
+                    None,
+                    lambda: upload_recursive(file_path, folder_id, is_root=True)
                 )
-            )
+
+            else:
+                # Single file upload
+                gdrive_result = await loop.run_in_executor(
+                    None,
+                    lambda: self.gdrive.upload_file(
+                        file_path=file_path,
+                        filename=actual_filename,
+                        folder_id=folder_id,
+                        description=f"Downloaded from: {url}",
+                        progress_callback=upload_progress_callback if telegram_chat_id else None
+                    )
+                )
+            
+            # (Zip cleanup removed)
+            is_temp_zip = False  # Flag kept for compatibility with variable defined later if any
             
             gdrive_link = gdrive_result.get('webViewLink')
             gdrive_file_id = gdrive_result.get('id')
@@ -346,14 +434,8 @@ class DownloadWorker:
             
             logger.info(f"Task {task_id} completed: {gdrive_link}")
             
-            # Cleanup downloaded file after successful upload
-            try:
-                if os.path.exists(file_path):
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                    self.downloader.cleanup(file_path)
-                    logger.info(f"Cleaned up downloaded file: {actual_filename} ({file_size_mb:.1f} MB freed)")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup file {file_path}: {cleanup_error}")
+            # Clean up downloaded file after successful upload
+            self._cleanup_path(file_path, f"completed task {task_id}")
             
         except asyncio.CancelledError as e:
             # Task was cancelled by user
@@ -361,22 +443,7 @@ class DownloadWorker:
             logger.info(f"Task {task_id} was cancelled: {error_msg}")
             
             # Clean up downloaded file if exists
-            if file_path and os.path.exists(file_path):
-                try:
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up file from cancelled task: {file_path} ({file_size_mb:.1f} MB freed)")
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup cancelled task file: {cleanup_error}")
-            
-            # Clean up downloaded file if exists
-            if file_path and os.path.exists(file_path):
-                try:
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up file from cancelled task: {file_path} ({file_size_mb:.1f} MB freed)")
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup cancelled task file: {cleanup_error}")
+            self._cleanup_path(file_path, f"cancelled task {task_id}")
             
             # Update task as cancelled
             self.task_manager.update_task(
@@ -408,22 +475,7 @@ class DownloadWorker:
             logger.error(f"Task {task_id} failed: {error_msg}", exc_info=True)
             
             # Clean up downloaded file if exists
-            if file_path and os.path.exists(file_path):
-                try:
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up file from failed task: {file_path} ({file_size_mb:.1f} MB freed)")
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup failed task file: {cleanup_error}")
-            
-            # Clean up downloaded file if exists
-            if file_path and os.path.exists(file_path):
-                try:
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up file from failed task: {file_path} ({file_size_mb:.1f} MB freed)")
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup failed task file: {cleanup_error}")
+            self._cleanup_path(file_path, f"failed task {task_id}")
             
             # Update task as failed
             self.task_manager.update_task(
@@ -464,12 +516,18 @@ class DownloadWorker:
         
         while self._running:
             try:
-                task_id = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                # Use wait_for to check cancellation or shutdown if needed, or simply await get()
+                # But here wait_for allows us to log "tick" or handle shutdown gracefully if needed
+                # However, await self._queue.get() is fine and efficient.
+                task_id = await self._queue.get()
+                logger.info(f"Processing task {task_id}")
                 await self.process_task(task_id)
-            except asyncio.TimeoutError:
-                continue
+            except asyncio.CancelledError:
+                logger.info("Worker cancelled")
+                break
             except Exception as e:
                 logger.error(f"Worker error: {e}", exc_info=True)
+                await asyncio.sleep(1) # Prevent tight loop on error
     
     def stop(self):
         """Stop the worker."""

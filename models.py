@@ -1,8 +1,11 @@
 """Pydantic models for the application."""
 from pydantic import BaseModel, Field, HttpUrl
 from typing import Optional, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class DownloadStatus(str, Enum):
@@ -17,7 +20,7 @@ class DownloadStatus(str, Enum):
 
 class DownloadRequest(BaseModel):
     """Request model for downloading a file."""
-    url: HttpUrl = Field(..., description="URL of the file to download")
+    url: str = Field(..., description="URL or Magnet link")
     filename: Optional[str] = Field(None, description="Custom filename (optional)")
     folder_id: Optional[str] = Field(None, description="Google Drive folder ID (optional)")
     callback_url: Optional[HttpUrl] = Field(None, description="Webhook URL for notification (optional)")
@@ -39,7 +42,7 @@ class DownloadResponse(BaseModel):
     task_id: str = Field(..., description="Unique task ID for tracking")
     status: DownloadStatus = Field(..., description="Current status")
     message: str = Field(..., description="Status message")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
     
     class Config:
         json_schema_extra = {
@@ -78,12 +81,12 @@ class NotificationPayload(BaseModel):
     gdrive_link: Optional[str] = None
     filename: Optional[str] = None
     file_size_human: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_utcnow)
 
 
 class HealthResponse(BaseModel):
     """Health check response."""
     status: Literal["healthy", "unhealthy"] = "healthy"
     version: str = "1.0.0"
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_utcnow)
     services: dict = Field(default_factory=dict)

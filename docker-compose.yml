@@ -1,22 +1,28 @@
 version: '3.8'
 
 services:
-  app:
+  mirror-bot:
     build: .
-    container_name: mirror-download
+    container_name: mirror-bot
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
       - ./downloads:/app/downloads
-      - ./credentials.json:/app/credentials.json:ro
+      - ./config.py:/app/config.py
+      - ./credentials.json:/app/credentials.json
       - ./token.json:/app/token.json
-      - ./.env:/app/.env:ro
+      # Mount .env if you want to use it directly, though env_file handles loading vars
+      - ./.env:/app/.env
+    env_file:
+      - .env
     environment:
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - TEMP_DOWNLOAD_DIR=/app/downloads
+      - IS_DOCKER=true
+
+  # Optional: Redis for Celery if enabled
+  # redis:
+  #   image: redis:alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"

@@ -35,7 +35,7 @@ class FileDownloader:
                     encoding, _, name = filename_part.partition("''")
                     try:
                         filename = unquote(name)
-                    except:
+                    except Exception: # Fix: Use specific exception or log it
                         filename = name
             else:
                 filename = content_disp.split('filename=')[1].strip('"\'').split(';')[0]
@@ -203,53 +203,16 @@ class FileDownloader:
                 counter += 1
             
             # Check size
-            total_size = headers.get('Content-Length')
-            if total_size:
-                total_size = int(total_size)
-                if total_size > self.settings.MAX_FILE_SIZE:
-                    raise ValueError(f"File too large: {self._human_readable_size(total_size)}")
+            total_size_header = headers.get('Content-Length')
+            if total_size_header:
+                total_size = int(total_size_header)
+                # Check only if MAX_FILE_SIZE is set and greater than 0 (0 = unlimited)
+                if self.settings.MAX_FILE_SIZE > 0 and total_size > self.settings.MAX_FILE_SIZE:
+                    raise ValueError(f"File too large: {self._human_readable_size(total_size)} (Limit: {self._human_readable_size(self.settings.MAX_FILE_SIZE)})")
             
             # Download
             logger.info(f"Downloading to: {file_path}")
             
-            partial_file = None
-            try:
-                async with session.get(
-                    final_url,
-                    headers=self._get_browser_headers(),
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    response.raise_for_status()
-                    
-                    downloaded = 0
-                    start_time = time.time()
-                    last_update = start_time
-                    partial_file = str(file_path)
-                    
-                    with open(file_path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(self.settings.CHUNK_SIZE):
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            current_time = time.time()
-                            elapsed = current_time - start_time
-                            
-                            if progress_callback and (current_time - last_update >= 1 or downloaded == total_size):
-                                speed_kbps = (downloaded / 1024) / elapsed if elapsed > 0 else 0
-                                progress_callback(downloaded, total_size, speed_kbps)
-                                last_update = current_time
-            
-            except asyncio.CancelledError:
-                # Clean up partial download
-                if partial_file and os.path.exists(partial_file):
-                    try:
-                        file_size = os.path.getsize(partial_file)
-                        os.remove(partial_file)
-                        logger.info(f"Cleaned up partial download: {partial_file} ({file_size} bytes)")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up partial file {partial_file}: {e}")
-                raise  # Re-raise the CancelledError
             partial_file = None
             try:
                 async with session.get(
@@ -334,10 +297,16 @@ class FileDownloader:
             }
     
     def cleanup(self, file_path: str):
-        """Delete downloaded file."""
+        """Delete downloaded file or directory."""
         try:
-            if os.path.exists(file_path):
+            if not os.path.exists(file_path):
+                return
+                
+            if os.path.isfile(file_path):
                 os.remove(file_path)
-                logger.info(f"Cleaned up: {file_path}")
+            elif os.path.isdir(file_path):
+                import shutil
+                shutil.rmtree(file_path)
+            logger.info(f"Cleaned up: {file_path}")
         except Exception as e:
             logger.warning(f"Failed to cleanup {file_path}: {e}")

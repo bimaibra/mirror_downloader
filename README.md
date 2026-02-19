@@ -1,144 +1,168 @@
-# Mirror Download Server (Private)
+# Mirror Download Bot
 
-A private FastAPI-based server for downloading files from URLs and uploading them to Google Drive. **This is an admin-only private server.**
+A private FastAPI server that downloads files from URLs or torrents and uploads them to Google Drive, with a Telegram bot interface for admin control.
 
 ## Features
 
-- 🔒 **Private & Secure** - Only admin can access
-- 📥 Download files from direct URLs
-- ☁️ Upload to Google Drive
-- 📱 Telegram bot integration for admin
-- 📊 Task tracking and status monitoring
-- 🚀 Async processing with background workers
-- ⏸️ Supports download resume
-- 📁 Automatic file organization
+- 🔒 **Private & Secure** — API key auth, admin-only Telegram bot
+- 📥 **Direct URL Downloads** — resumable, with progress tracking
+- 🧲 **Torrent Downloads** — send `.torrent` files via Telegram
+- ☁️ **Google Drive Upload** — auto-upload with folder organization
+- 📱 **Telegram Bot** — real-time progress bars, inline status updates
+- 🚀 **Async Background Worker** — non-blocking task queue
+- 🐳 **Docker Support** — ready-to-deploy with Docker Compose
+- 📒 **Google Colab Support** — run in Colab with ngrok tunneling
+
+## Project Structure
+
+```
+├── main.py              # FastAPI app + Telegram webhook handler
+├── worker.py            # Background download/upload worker
+├── config.py            # Settings (from .env)
+├── models.py            # Pydantic models
+├── task_manager.py      # Task persistence (tasks.json)
+├── client.py            # CLI client for the API
+├── celery_app.py        # Celery config (optional)
+├── tasks.py             # Celery task definitions
+├── colab_config.py      # Google Colab environment setup
+├── colab_runner.ipynb   # Colab notebook to run the bot
+├── services/
+│   ├── downloader.py    # File download logic (HTTP, resume)
+│   ├── gdrive_service.py# Google Drive API wrapper
+│   ├── telegram_service.py # Telegram Bot API wrapper
+│   ├── torrent_service.py  # Libtorrent integration
+│   └── tunnel_service.py   # Ngrok tunnel management
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+└── .env.example
+```
 
 ## Quick Start
 
-### 1. Setup Environment
+### 1. Install Dependencies
 
 ```bash
-# Create virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### 2. Configure Google Drive
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project → Enable Google Drive API
+2. Create a project → Enable **Google Drive API**
 3. Create OAuth credentials (Desktop app type)
-4. Download `credentials.json` and place in project root
+4. Download `credentials.json` to project root
 
 ### 3. Configure Environment
 
 ```bash
 cp .env.example .env
-# Edit .env with your settings:
-# - API_KEY (strong secret key)
-# - TELEGRAM_BOT_TOKEN (optional, from @BotFather)
-# - TELEGRAM_ADMIN_CHAT_ID (your chat ID from @userinfobot)
-# - GDRIVE_FOLDER_ID (optional, default folder for downloads)
 ```
 
-### 4. Run the Server
+Edit `.env` with your values:
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `API_KEY` | Secret key for API auth | ✅ |
+| `TELEGRAM_BOT_TOKEN` | From [@BotFather](https://t.me/BotFather) | For bot |
+| `TELEGRAM_ADMIN_CHAT_ID` | Your chat ID (from [@userinfobot](https://t.me/userinfobot)) | For bot |
+| `GDRIVE_FOLDER_ID` | Default Google Drive folder ID | Optional |
+| `MAX_FILE_SIZE` | Max file size in bytes (0 = unlimited) | Optional |
+| `DOWNLOAD_TIMEOUT` | Timeout in seconds | Default: 3600 |
+| `NGROK_AUTHTOKEN` | Ngrok auth token for tunneling | For Colab |
+| `USE_CELERY` | Enable Celery workers (`true`/`false`) | Optional |
+| `REDIS_URL` | Redis URL for Celery | If Celery |
+
+### 4. Run
 
 ```bash
 python main.py
 ```
 
-The server will start on `http://localhost:8000` and open a browser for Google Drive authentication on first run.
+Server starts at `http://localhost:8000`. On first run, a browser window opens for Google Drive OAuth.
 
-## API Usage
+## Telegram Bot Commands
 
-All endpoints require the API key in the `X-API-Key` header.
+| Command | Description |
+|---------|-------------|
+| `/start`, `/help` | Show help message |
+| `/status <task_id>` | Check task status with progress bar |
+| `/abort <task_id>` | Cancel a running task |
+| Send any URL | Start downloading |
+| Send `.torrent` file | Start torrent download |
 
-### Submit Download
+## API Endpoints
+
+All endpoints require `X-API-Key` header.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check & service status |
+| `POST` | `/download` | Submit download task |
+| `GET` | `/status/{task_id}` | Get task status |
+| `GET` | `/tasks` | List tasks (filter by status) |
+| `POST` | `/preview` | Get file info without downloading |
+| `DELETE` | `/tasks/{task_id}` | Cancel a task |
+| `POST` | `/webhook/telegram` | Telegram webhook (auto-configured) |
+
+### Example
 
 ```bash
+# Submit download
 curl -X POST "http://localhost:8000/download" \
   -H "X-API-Key: your-secret-key" \
   -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://example.com/file.zip",
-    "filename": "my-file.zip",
-    "folder_id": "optional-gdrive-folder-id"
-  }'
-```
+  -d '{"url": "https://example.com/file.zip"}'
 
-### Check Status
-
-```bash
+# Check status
 curl "http://localhost:8000/status/task-abc123" \
   -H "X-API-Key: your-secret-key"
 ```
 
-### List Tasks
+## CLI Client
 
 ```bash
-curl "http://localhost:8000/tasks?limit=10" \
-  -H "X-API-Key: your-secret-key"
-```
-
-### Preview File (without downloading)
-
-```bash
-curl -X POST "http://localhost:8000/preview" \
-  -H "X-API-Key: your-secret-key" \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com/file.zip"}'
-```
-
-### Cancel Task
-
-```bash
-curl -X DELETE "http://localhost:8000/tasks/task-abc123" \
-  -H "X-API-Key: your-secret-key"
-```
-
-## Telegram Bot (Admin Only)
-
-If configured, the bot only responds to the admin:
-
-- `/start` or `/help` - Show help message
-- Send any URL - Start download
-- `/status <task_id>` - Check task status
-- `/abort <task_id>` - Cancel a task
-
-## Configuration Options
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `API_KEY` | Secret key for API access | Required |
-| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | Optional |
-| `TELEGRAM_ADMIN_CHAT_ID` | Your Telegram chat ID | Required for bot |
-| `GDRIVE_FOLDER_ID` | Default Google Drive folder | Optional |
-| `MAX_FILE_SIZE` | Maximum file size (bytes) | 5 GB |
-| `DOWNLOAD_TIMEOUT` | Download timeout (seconds) | 3600 |
-
-## Client Usage
-
-Use the included Python client:
-
-```bash
-python client.py -u http://localhost:8000 -k your-secret-key download "https://example.com/file.zip"
-
-# With wait for completion
-python client.py -u http://localhost:8000 -k your-secret-key -w download "https://example.com/file.zip"
+# Download with wait
+python client.py -u http://localhost:8000 -k your-key -w download "https://example.com/file.zip"
 
 # Check status
-python client.py -u http://localhost:8000 -k your-secret-key status task-abc123
+python client.py -u http://localhost:8000 -k your-key status task-abc123
 ```
 
-## Docker
+## Deployment Options
+
+### Docker
 
 ```bash
-docker build -t mirror-downloader .
-docker run -p 8000:8000 --env-file .env mirror-downloader
+docker compose up -d
 ```
+
+### Google Colab
+
+1. Upload entire project folder to Google Drive
+2. Open `colab_runner.ipynb` in Colab
+3. Set environment variables (bot token, API key, ngrok token)
+4. Run all cells — server starts with ngrok tunnel + auto webhook setup
+
+See `COLAB_MIGRATION_DETAILS.md` for additional notes.
+
+### VPS / EC2
+
+Use ngrok or a reverse proxy (nginx) with SSL for Telegram webhook support:
+
+```bash
+# Option 1: ngrok (quick)
+ngrok http 8000
+
+# Option 2: Set NGROK_AUTHTOKEN in .env (auto-starts with server)
+```
+
+## Disclaimer
+
+> [!WARNING]
+> This project is intended for **personal and legitimate use only**. Any misuse, illegal activity, or copyright infringement conducted using this tool is solely the responsibility of the user. The developer and this repository bear **no responsibility** for any damages, legal consequences, or violations arising from the misuse of this software.
 
 ## License
 

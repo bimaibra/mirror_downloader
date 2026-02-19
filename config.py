@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     USE_CELERY: bool = False  # Set to True to enable Celery (requires Redis)
     
     # Download Settings
-    MAX_FILE_SIZE: int = 5 * 1024 * 1024 * 1024  # 5 GB
+    MAX_FILE_SIZE: int = 0  # 0 for unlimited, default 5GB
     CHUNK_SIZE: int = 8192  # 8 KB chunks for streaming
     DOWNLOAD_TIMEOUT: int = 3600  # 1 hour
     TEMP_DOWNLOAD_DIR: str = "./downloads"
@@ -37,8 +37,21 @@ class Settings(BaseSettings):
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 10
     
+    # User Folder Separation
+    GDRIVE_PUBLIC_FOLDER_ID: str = ""
+    GDRIVE_USERS_ROOT_FOLDER_ID: str = ""
+
+    # Bot Access Control
+    CODE_EXPIRY_HOURS: int = 24
+    USER_ACCESS_DURATION_HOURS: int = 168
+    MAX_CODES_PER_ADMIN: int = 10
+    
+    # Cloudflare / Networking
+    NGROK_AUTHTOKEN: str = ""
+    
     class Config:
         env_file = ".env"
+        extra = "ignore"  # Ignore extra fields in .env to prevent crashes
 
 
 @lru_cache()

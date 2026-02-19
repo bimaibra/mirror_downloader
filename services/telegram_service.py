@@ -329,6 +329,40 @@ The task has been cancelled by user.
         
         await self.send_message(chat_id, message)
     
+    async def get_file_path(self, file_id: str) -> Optional[str]:
+        """Get file path from Telegram API."""
+        if not self.enabled or not self.bot:
+            return None
+        
+        try:
+            file_obj = await self.bot.get_file(file_id)
+            return file_obj.file_path
+        except Exception as e:
+            logger.error(f"Failed to get file path for {file_id}: {e}")
+            return None
+    
+    async def download_file(self, file_path: str, destination: str) -> bool:
+        """Download file from Telegram to destination."""
+        try:
+            # Construct the full URL for downloading the file
+            # If file_path is already a full URL, this will be incorrect, but get_file_path returns relative path
+            if not file_path.startswith('http'):
+                download_url = f"https://api.telegram.org/file/bot{self.settings.TELEGRAM_BOT_TOKEN}/{file_path}"
+            else:
+                download_url = file_path
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(download_url)
+                if response.status_code == 200:
+                    with open(destination, 'wb') as f:
+                        f.write(response.content)
+                    return True
+                logger.error(f"Failed to download file: Status {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to download file from Telegram: {e}")
+            return False
+
     async def send_admin_notification(self, message: str):
         """Send notification to admin."""
         if self.settings.TELEGRAM_ADMIN_CHAT_ID:
@@ -336,7 +370,29 @@ The task has been cancelled by user.
                 self.settings.TELEGRAM_ADMIN_CHAT_ID,
                 f"🔔 <b>Admin Notification</b>\n\n{message}"
             )
-
+            
+    async def set_webhook(self, url: str) -> bool:
+        """Set the webhook for the bot."""
+        if not self.enabled or not self.bot:
+            return False
+            
+        try:
+            logger.info(f"Setting webhook to: {url}")
+            await self.bot.set_webhook(url=url)
+            logger.info(f"✅ Webhook set successfully to {url}")
+            
+            # Send confirmation and info to admin
+            if self.settings.TELEGRAM_ADMIN_CHAT_ID:
+                 try:
+                    chat_info = await self.bot.get_chat(self.settings.TELEGRAM_ADMIN_CHAT_ID)
+                    logger.info(f"Admin chat accessible: {chat_info.title or chat_info.username}")
+                 except Exception as e:
+                    logger.warning(f"Could not access admin chat {self.settings.TELEGRAM_ADMIN_CHAT_ID}: {e}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to set webhook: {e}")
+            return False
 
 # Singleton instance
 telegram_service = None

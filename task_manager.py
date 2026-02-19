@@ -3,7 +3,7 @@ import uuid
 import json
 import logging
 from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -67,7 +67,7 @@ class TaskManager:
             'gdrive_link': None,
             'gdrive_file_id': None,
             'error_message': None,
-            'created_at': datetime.utcnow().isoformat(),
+            'created_at': datetime.now(timezone.utc).isoformat(),
             'updated_at': None,
             'completed_at': None
         }
@@ -108,7 +108,7 @@ class TaskManager:
             if status:
                 task['status'] = status.value
                 if status == DownloadStatus.COMPLETED:
-                    task['completed_at'] = datetime.utcnow().isoformat()
+                    task['completed_at'] = datetime.now(timezone.utc).isoformat()
             
             if progress is not None:
                 task['progress'] = progress
@@ -134,7 +134,7 @@ class TaskManager:
             if error_message:
                 task['error_message'] = error_message
             
-            task['updated_at'] = datetime.utcnow().isoformat()
+            task['updated_at'] = datetime.now(timezone.utc).isoformat()
             self._save_tasks()
     
     def delete_task(self, task_id: str):

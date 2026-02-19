@@ -26,6 +26,7 @@ from task_manager import get_task_manager
 from worker import get_worker
 from services.telegram_service import get_telegram_service
 from services.gdrive_service import get_gdrive_service
+from services.tunnel_service import get_tunnel_service
 
 # Setup logging
 logging.basicConfig(
@@ -182,15 +183,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Cleanup cancelled/failed tasks failed: {e}")
     
-    # Cleanup files from cancelled/failed tasks first
-    try:
-        cleanup_cancelled_failed_tasks()
-    except Exception as e:
-        logger.warning(f"Cleanup cancelled/failed tasks failed: {e}")
-    
     # Cleanup old downloaded files on startup (files older than 24 hours)
     try:
-        import subprocess
         result = subprocess.run(
             [sys.executable, 'cleanup.py', '--hours', '24', '--cron'],
             capture_output=True,
@@ -215,6 +209,35 @@ async def lifespan(app: FastAPI):
     # Start worker in background
     worker = get_worker()
     worker_task = asyncio.create_task(worker.start())
+    
+    # Start Tunnel (Ingress)
+    # Only if configured or in Colab
+    tunnel = get_tunnel_service()
+    public_url = tunnel.start_tunnel(port=8000)
+    
+    if public_url and telegram.enabled:
+        # Update Webhook if needed
+        logger.info(f"Public URL: {public_url}")
+
+        # Set Webhook URL
+        webhook_url = f"{public_url}/webhook/telegram"
+        success = await telegram.set_webhook(webhook_url)
+
+        message = f"🚀 <b>Server Started!</b>\n\n🌐 Public URL: {public_url}\n\n"
+        if success:
+             message += "✅ Webhook successfully set!\n\n"
+        else:
+             message += "❌ Webhook setup failed! Check server logs.\n\n"
+
+        message += "Happy downloading!"
+
+        # Optionally send this to admin
+        await telegram.send_message(
+            chat_id=settings.TELEGRAM_ADMIN_CHAT_ID,
+            message=message
+        )
+    elif not public_url and telegram.enabled:
+        logger.warning("⚠️ No public URL found (Ngrok failed?). Webhook NOT set. Bot may not respond.")
     
     logger.info("Server ready!")
     yield
@@ -241,7 +264,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -446,9 +469,8 @@ def format_wib(dt_str: str, fmt: str = '%Y-%m-%d %H:%M') -> str:
             dt = dt.replace(tzinfo=timezone.utc)
         wib_dt = dt.astimezone(WIB)
         return wib_dt.strftime(fmt)
-    except:
-        return dt_str
-
+    except Exception:
+        return dt_str  # Return original if formatting fails
 
 # Webhook endpoint for Telegram (Admin only)
 @app.post("/webhook/telegram")
@@ -466,9 +488,6 @@ async def telegram_webhook(update: dict):
     chat_id = str(message.get('chat', {}).get('id'))
     text = message.get('text', '').strip()
     
-    if not text:
-        return {"ok": True}
-    
     # Check if sender is admin
     if chat_id != settings.TELEGRAM_ADMIN_CHAT_ID:
         await telegram.send_message(
@@ -477,147 +496,69 @@ async def telegram_webhook(update: dict):
         )
         return {"ok": True}
     
-    # Commands
+    # --- Helper: download a torrent file from Telegram ---
+    async def _download_torrent_from_telegram(doc: dict) -> str | None:
+        """Download a .torrent file attached to a Telegram message. Returns local path or None."""
+        file_name = doc.get('file_name', '')
+        mime_type = doc.get('mime_type', '')
+        
+        if not file_name:
+            file_name = f"download_{doc.get('file_unique_id', 'unknown')}.torrent"
+        
+        if not (file_name.endswith('.torrent') or mime_type == 'application/x-bittorrent'):
+            return None
+        
+        file_id = doc['file_id']
+        logger.info(f"Processing torrent file: {file_name}")
+        
+        torrent_path = os.path.join(settings.TEMP_DOWNLOAD_DIR, file_name)
+        
+        tg_file_path = await telegram.get_file_path(file_id)
+        if not tg_file_path:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Failed to get file info from Telegram."
+            )
+            return None
+        
+        if await telegram.download_file(tg_file_path, torrent_path):
+            return torrent_path
+        else:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ Failed to download .torrent file from Telegram."
+            )
+            return None
+    
+    # ==========================================
+    # 1. Handle commands FIRST (before URL/doc)
+    # ==========================================
+    
     if text == '/start' or text == '/help':
         await telegram.send_message(
             chat_id=chat_id,
             message="""
-🤖 <b>Mirror Download Bot</b> (Private)
+🤖 <b>Mirror Download Bot (v1.0)</b>
 
-You are the admin. Send me a direct download link and I'll upload it to Google Drive.
+I can download files from direct URLs or Torrents and upload them to Google Drive.
 
-<b>Commands:</b>
-• /status &lt;task_id&gt; - Check task status
-• /abort &lt;task_id&gt; - Cancel a running task
-• /help - Show this help
+<b>How to use:</b>
+1️⃣ <b>Direct Link:</b> Just send any http/https link
+   <i>Example: https://example.com/file.zip</i>
 
-Just paste any URL to start downloading.
+2️⃣ <b>Torrent:</b> Send a <code>.torrent</code> file directly to this chat
+
+3️⃣ <b>Commands:</b>
+• <code>/status &lt;task_id&gt;</code> - Check specific task status
+• <code>/abort &lt;task_id&gt;</code> - Cancel a running task
+• <code>/tasks</code> - List active tasks (ToDo)
+• <code>/help</code> - Show this message
+
+🚀 <b>Note:</b> Make sure the link is a <b>direct download link</b>.
             """.strip()
         )
         return {"ok": True}
     
-    # URL detection (direct link sent)
-    if text.startswith(('http://', 'https://')):
-        import re
-        # Extract URL
-        url_match = re.match(r'(https?://\S+)', text)
-        if not url_match:
-            await telegram.send_message(
-                chat_id=chat_id,
-                message="❌ <b>Invalid URL format</b>\n\nCould not parse the URL."
-            )
-            return {"ok": True}
-        
-        url = url_match.group(1)
-        logger.info(f"Processing URL from admin: {url}")
-        
-        try:
-            downloader = FileDownloader()
-            info = await downloader.get_file_info(url)
-            
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
-📥 <b>Starting Download...</b>
-
-📄 <b>File:</b> <code>{info['filename']}</code>
-📦 <b>Size:</b> {info['size_human']}
-📋 <b>Type:</b> {info['content_type']}
-
-⏳ Queuing download...
-                """.strip()
-            )
-            
-            # Create task
-            task_manager = get_task_manager()
-            worker = get_worker()
-            
-            # Use admin's preferred folder or default
-            folder_id = settings.GDRIVE_FOLDER_ID if settings.GDRIVE_FOLDER_ID else None
-            
-            task_id = task_manager.create_task(
-                url=url,
-                filename=info['filename'],
-                folder_id=folder_id,
-                telegram_chat_id=str(chat_id)
-            )
-            
-            worker.queue_task(task_id)
-            
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
-✅ <b>Download Queued!</b>
-
-🆔 Task ID: <code>{task_id}</code>
-
-⏱️ I'll notify you when it's ready!
-                """.strip()
-            )
-            return {"ok": True}
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to process URL {url}: {error_msg}", exc_info=True)
-            
-            # Provide user-friendly error messages
-            if "Could not find" in error_msg or "downloadable file" in error_msg.lower():
-                user_message = """❌ <b>Download Link Not Found</b>
-
-Could not find a direct download link in this URL.
-
-<b>Possible reasons:</b>
-• Link expired or requires login
-• Site uses JavaScript to generate download link
-• Anti-bot protection (CAPTCHA, etc.)
-• Premium account required
-
-<b>Solutions:</b>
-1. Try accessing the link in browser first
-2. Use the direct download URL (not the page URL)
-3. Some file hosts block automated downloads"""
-            
-            elif "ClientConnectorError" in error_msg or "Cannot connect" in error_msg:
-                user_message = f"""❌ <b>Cannot Connect to Server</b>
-
-The server might be:
-• Down or unreachable
-• Blocking your region/IP
-• Rate-limiting requests
-
-<code>{error_msg[:150]}</code>"""
-            
-            elif "403" in error_msg or "Forbidden" in error_msg:
-                user_message = """❌ <b>Access Denied (403)</b>
-
-Server blocked the request.
-
-<b>Common causes:</b>
-• Missing Referer header
-• Anti-bot protection
-• IP blocked
-• Requires premium account
-
-<b>Try:</b>
-• Use direct link from browser's download manager
-• Different file host"""
-            
-            elif "404" in error_msg or "Not Found" in error_msg:
-                user_message = """❌ <b>File Not Found (404)</b>
-
-The file doesn't exist at this URL.
-It may have been deleted or moved."""
-            else:
-                user_message = f"""❌ <b>Failed to Process URL</b>
-
-<code>{error_msg[:200]}</code>
-
-Please try again."""
-            
-            await telegram.send_message(chat_id=chat_id, message=user_message)
-            return {"ok": True}
-    
-    # /abort command
     if text.startswith('/abort'):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -638,7 +579,6 @@ Please try again."""
             )
             return {"ok": True}
         
-        # Check if task can be cancelled
         if task['status'] not in ['pending', 'downloading', 'uploading']:
             await telegram.send_message(
                 chat_id=chat_id,
@@ -646,44 +586,29 @@ Please try again."""
             )
             return {"ok": True}
         
-        # Cancel the task in worker
         worker = get_worker()
         worker_cancelled = worker.cancel_task(task_id)
         
-        # Cancel the task in task manager
         task_manager.update_task(
             task_id,
             status=DownloadStatus.CANCELLED,
             message="Task cancelled by admin"
         )
         
-        if worker_cancelled:
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
+        status_detail = "will stop shortly" if worker_cancelled else "was not actively running"
+        await telegram.send_message(
+            chat_id=chat_id,
+            message=f"""
 🚫 <b>Task Aborted</b>
 
 🆔 <code>{task_id}</code>
 📄 File: <code>{task.get('filename', 'N/A')}</code>
 
-The task has been cancelled and will stop shortly.
-                """.strip()
-            )
-        else:
-            await telegram.send_message(
-                chat_id=chat_id,
-                message=f"""
-🚫 <b>Task Aborted</b>
-
-🆔 <code>{task_id}</code>
-📄 File: <code>{task.get('filename', 'N/A')}</code>
-
-The task has been cancelled (was not actively running).
-                """.strip()
-            )
+The task has been cancelled ({status_detail}).
+            """.strip()
+        )
         return {"ok": True}
     
-    # /status command
     if text.startswith('/status'):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -713,7 +638,6 @@ The task has been cancelled (was not actively running).
             'cancelled': '🚫'
         }.get(task['status'], '❓')
         
-        # Create progress bar
         def create_progress_bar(progress: float, length: int = 20) -> str:
             filled = int(length * progress / 100)
             empty = length - filled
@@ -738,7 +662,6 @@ The task has been cancelled (was not actively running).
             
             msg += f"\n\n<i>Send /abort {task_id} to cancel</i>"
             
-            # Delete old progress message
             try:
                 telegram_service = get_telegram_service()
                 if task_id in telegram_service._progress_messages:
@@ -751,7 +674,6 @@ The task has been cancelled (was not actively running).
             except Exception:
                 pass
             
-            # Send new message
             new_msg = await telegram.send_message(chat_id=chat_id, message=msg)
             if new_msg and task_id:
                 try:
@@ -805,12 +727,154 @@ The task has been cancelled (was not actively running).
         await telegram.send_message(chat_id=chat_id, message=msg)
         return {"ok": True}
     
-    # Unknown command
     if text.startswith('/'):
         await telegram.send_message(
             chat_id=chat_id,
             message="❓ Unknown command. Send /help for available commands."
         )
+        return {"ok": True}
+    
+    # ==========================================
+    # 2. Determine URL from message content
+    # ==========================================
+    url = None
+    
+    # Direct document (torrent file)
+    if 'document' in message:
+        url = await _download_torrent_from_telegram(message['document'])
+        if url is None:
+            return {"ok": True}
+    
+    # URL in text
+    elif text.startswith(('http://', 'https://')):
+        import re
+        url_match = re.match(r'(https?://\S+)', text)
+        if not url_match:
+            await telegram.send_message(
+                chat_id=chat_id,
+                message="❌ <b>Invalid URL format</b>\n\nCould not parse the URL."
+            )
+            return {"ok": True}
+        url = url_match.group(1)
+    
+    # Reply to a document (torrent)
+    elif 'reply_to_message' in message and 'document' in message.get('reply_to_message', {}):
+        url = await _download_torrent_from_telegram(message['reply_to_message']['document'])
+        if url is None:
+            return {"ok": True}
+    
+    # Nothing to process
+    if not url:
+        return {"ok": True}
+    
+    # ==========================================
+    # 3. Process URL (download + queue)
+    # ==========================================
+    logger.info(f"Processing URL/Path from admin: {url}")
+        
+    try:
+        if url.endswith('.torrent') and os.path.exists(url):
+            info = {'filename': os.path.basename(url), 'size_human': 'Unknown', 'content_type': 'application/x-bittorrent'}
+        else:
+            downloader = FileDownloader()
+            info = await downloader.get_file_info(url)
+            
+        await telegram.send_message(
+            chat_id=chat_id,
+            message=f"""
+📥 <b>Starting Download...</b>
+
+📄 <b>File:</b> <code>{info['filename']}</code>
+📦 <b>Size:</b> {info['size_human']}
+📋 <b>Type:</b> {info['content_type']}
+
+⏳ Queuing download...
+            """.strip()
+        )
+            
+        task_manager = get_task_manager()
+        worker = get_worker()
+        
+        folder_id = settings.GDRIVE_FOLDER_ID if settings.GDRIVE_FOLDER_ID else None
+        
+        task_id = task_manager.create_task(
+            url=url,
+            filename=info['filename'],
+            folder_id=folder_id,
+            telegram_chat_id=str(chat_id)
+        )
+        
+        worker.queue_task(task_id)
+        
+        await telegram.send_message(
+            chat_id=chat_id,
+            message=f"""
+✅ <b>Download Queued!</b>
+
+🆔 Task ID: <code>{task_id}</code>
+
+⏱️ I'll notify you when it's ready!
+            """.strip()
+        )
+            
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Failed to process URL {url}: {error_msg}", exc_info=True)
+        
+        if "Could not find" in error_msg or "downloadable file" in error_msg.lower():
+            user_message = """❌ <b>Download Link Not Found</b>
+
+Could not find a direct download link in this URL.
+
+<b>Possible reasons:</b>
+• Link expired or requires login
+• Site uses JavaScript to generate download link
+• Anti-bot protection (CAPTCHA, etc.)
+• Premium account required
+
+<b>Solutions:</b>
+1. Try accessing the link in browser first
+2. Use the direct download URL (not the page URL)
+3. Some file hosts block automated downloads"""
+        
+        elif "ClientConnectorError" in error_msg or "Cannot connect" in error_msg:
+            user_message = f"""❌ <b>Cannot Connect to Server</b>
+
+The server might be:
+• Down or unreachable
+• Blocking your region/IP
+• Rate-limiting requests
+
+<code>{error_msg[:150]}</code>"""
+        
+        elif "403" in error_msg or "Forbidden" in error_msg:
+            user_message = """❌ <b>Access Denied (403)</b>
+
+Server blocked the request.
+
+<b>Common causes:</b>
+• Missing Referer header
+• Anti-bot protection
+• IP blocked
+• Requires premium account
+
+<b>Try:</b>
+• Use direct link from browser's download manager
+• Different file host"""
+        
+        elif "404" in error_msg or "Not Found" in error_msg:
+            user_message = """❌ <b>File Not Found (404)</b>
+
+The file doesn't exist at this URL.
+It may have been deleted or moved."""
+        else:
+            user_message = f"""❌ <b>Failed to Process URL</b>
+
+<code>{error_msg[:200]}</code>
+
+Please try again."""
+        
+        await telegram.send_message(chat_id=chat_id, message=user_message)
     
     return {"ok": True}
 
@@ -822,7 +886,7 @@ async def global_exception_handler(request, exc):
     logger.error(f"Global exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error", "message": str(exc)}
+        content={"detail": "Internal server error"}
     )
 
 
